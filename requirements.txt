@@ -1,0 +1,2 @@
+aiogram==3.25.0
+apscheduler==3.11.2
