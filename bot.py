@@ -1,3 +1,7 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
 import asyncio
 import logging
 import sqlite3
@@ -10,9 +14,9 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 # ==================== НАСТРОЙКИ ====================
-BOT_TOKEN = "8104769190:AAFxWOFeC43FVBVo86qL0u7XIUlGHMEj_Iw"
-GROUP_ID = -1001720791478  # например: -1001234567890
-ADMIN_ID = 920157708    # твой Telegram ID
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROUP_ID = int(os.getenv("GROUP_ID", "0"))
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 
 # Темы недели (бот будет случайно выбирать)
 THEMES = [
