@@ -2,3 +2,5 @@
 trackday.db
 __pycache__/
 credentials.json
+backups/
+.venv/
