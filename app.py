@@ -2078,6 +2078,23 @@ async def start_voting():
         logging.warning("Failed to pin voting message: chat_id=%s message_id=%s err=%r", GROUP_ID, sent_main.message_id, e)
     return True, "started"
 
+async def unpin_voting_message():
+    """Четверг 14:00 — тихо открепляем сообщение с голосованием."""
+    voting_pin = get_group_pin(GROUP_ID, pin_type="voting_main")
+    if not voting_pin:
+        return
+    can_manage_pins = await bot_can_manage_pins(GROUP_ID)
+    if can_manage_pins:
+        try:
+            await bot.unpin_chat_message(chat_id=GROUP_ID, message_id=voting_pin["message_id"])
+        except Exception as e:
+            logging.warning("Failed to unpin voting message at 14:00: %r", e)
+        finally:
+            delete_group_pin(GROUP_ID, pin_type="voting_main")
+    else:
+        delete_group_pin(GROUP_ID, pin_type="voting_main")
+
+
 async def finish_voting():
     session = get_current_session()
     if not session:
@@ -2086,24 +2103,6 @@ async def finish_voting():
     if session[3] != 'voting':
         return
     update_session_state(session_id, 'finished')
-    voting_pin = get_group_pin(GROUP_ID, pin_type="voting_main")
-    if voting_pin:
-        can_manage_pins = await bot_can_manage_pins(GROUP_ID)
-        if can_manage_pins:
-            try:
-                await bot.unpin_chat_message(chat_id=GROUP_ID, message_id=voting_pin["message_id"])
-            except Exception as e:
-                logging.warning(
-                    "Failed to unpin voting message on finish: chat_id=%s message_id=%s err=%r",
-                    GROUP_ID,
-                    voting_pin["message_id"],
-                    e,
-                )
-            finally:
-                delete_group_pin(GROUP_ID, pin_type="voting_main")
-        else:
-            delete_group_pin(GROUP_ID, pin_type="voting_main")
-            logging.warning("Skip unpin voting message: insufficient rights in chat_id=%s", GROUP_ID)
     results = get_vote_results(session_id)
     if not results:
         return
@@ -3548,6 +3547,7 @@ async def main():
     scheduler.add_job(start_voting, CronTrigger(day_of_week="wed", hour=22, minute=0))
     scheduler.add_job(send_voting_closing_reminder, CronTrigger(day_of_week="thu", hour=11, minute=0))
     scheduler.add_job(finish_voting, CronTrigger(day_of_week="thu", hour=12, minute=0))
+    scheduler.add_job(unpin_voting_message, CronTrigger(day_of_week="thu", hour=14, minute=0))
     scheduler.add_job(cleanup_runtime_data_job, IntervalTrigger(hours=1))
     scheduler.start()
     print("🎵 Track Day Bot запущен!")
