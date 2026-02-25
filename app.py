@@ -1805,17 +1805,23 @@ async def start_collection():
         base_week = get_week_base()
         active = get_active_week_session(base_week)
         if active:
-            logging.info(f"start_collection skipped: active session already exists for {base_week}, state={active[3]}")
-            return
-        theme = get_random_theme()
-        existing = list_week_sessions(base_week)
-        if existing:
-            # Для автозапуска после finished не создаём новую suffix-сессию.
-            latest = existing[-1]
-            if latest[3] == "finished":
-                logging.info(f"start_collection skipped: latest session for {base_week} is finished")
+            # Сессия уже есть — проверяем, было ли отправлено объявление
+            if active[3] == "collecting" and not get_group_pin(GROUP_ID, pin_type="collection_main"):
+                logging.warning("start_collection retry: session exists but no pin, resending announcement")
+                session_id = active[0]
+                theme = active[2]
+            else:
+                logging.info(f"start_collection skipped: active session already exists for {base_week}, state={active[3]}")
                 return
-        session_id = create_session(theme, week_override=base_week)
+        else:
+            theme = get_random_theme()
+            existing = list_week_sessions(base_week)
+            if existing:
+                latest = existing[-1]
+                if latest[3] == "finished":
+                    logging.info(f"start_collection skipped: latest session for {base_week} is finished")
+                    return
+            session_id = create_session(theme, week_override=base_week)
         logging.info(f"Session created: id={session_id}, theme={theme}")
         sheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
         text = (
@@ -1908,12 +1914,16 @@ async def start_voting():
     if not session:
         return False, "no_session"
     if session[3] == 'voting':
-        logging.info(f"start_voting skipped: session {session[0]} already in voting")
-        return False, "already_voting"
-    if session[3] == 'finished':
+        # Если пин есть — всё уже было отправлено
+        if get_group_pin(GROUP_ID, pin_type="voting_main"):
+            logging.info(f"start_voting skipped: session already in voting with pin")
+            return False, "already_voting"
+        # Пина нет — сообщения не дошли, повторяем отправку
+        logging.warning(f"start_voting retry: state=voting but no pin, resending messages")
+    elif session[3] == 'finished':
         logging.info(f"start_voting skipped: session {session[0]} already finished")
         return False, "already_finished"
-    if session[3] != 'collecting':
+    elif session[3] != 'collecting':
         logging.info(f"start_voting skipped: session {session[0]} state={session[3]}")
         return False, "invalid_state"
     session_id = session[0]
@@ -1921,7 +1931,9 @@ async def start_voting():
     if not tracks:
         await bot.send_message(GROUP_ID, "😔 Никто не скинул трек на этой неделе...")
         return False, "no_tracks"
+    # create_session_nomination_snapshot идемпотентна: возвращает существующие если уже созданы
     session_nominations = create_session_nomination_snapshot(session_id)
+    # update_session_state и apply_points_event идемпотентны — безопасно вызвать повторно
     update_session_state(session_id, 'voting')
     for track in tracks:
         apply_points_event(
@@ -2079,20 +2091,21 @@ async def start_voting():
     return True, "started"
 
 async def unpin_voting_message():
-    """Четверг 14:00 — тихо открепляем сообщение с голосованием."""
-    voting_pin = get_group_pin(GROUP_ID, pin_type="voting_main")
-    if not voting_pin:
-        return
+    """Четверг 14:00 — тихо открепляем сообщения с голосованием и результатами."""
     can_manage_pins = await bot_can_manage_pins(GROUP_ID)
-    if can_manage_pins:
-        try:
-            await bot.unpin_chat_message(chat_id=GROUP_ID, message_id=voting_pin["message_id"])
-        except Exception as e:
-            logging.warning("Failed to unpin voting message at 14:00: %r", e)
-        finally:
-            delete_group_pin(GROUP_ID, pin_type="voting_main")
-    else:
-        delete_group_pin(GROUP_ID, pin_type="voting_main")
+    for pin_type in ("voting_main", "results_main"):
+        pin = get_group_pin(GROUP_ID, pin_type=pin_type)
+        if not pin:
+            continue
+        if can_manage_pins:
+            try:
+                await bot.unpin_chat_message(chat_id=GROUP_ID, message_id=pin["message_id"])
+            except Exception as e:
+                logging.warning("Failed to unpin %s at 14:00: %r", pin_type, e)
+            finally:
+                delete_group_pin(GROUP_ID, pin_type=pin_type)
+        else:
+            delete_group_pin(GROUP_ID, pin_type=pin_type)
 
 
 async def finish_voting():
@@ -2100,9 +2113,17 @@ async def finish_voting():
     if not session:
         return
     session_id = session[0]
-    if session[3] != 'voting':
+    if session[3] == 'finished':
+        # Если результаты уже были отправлены — пропускаем
+        if get_group_pin(GROUP_ID, pin_type="results_main"):
+            logging.info("finish_voting skipped: already finished with results pin")
+            return
+        # Пина нет — результаты не дошли, переотправляем
+        logging.warning("finish_voting retry: state=finished but no results pin, resending")
+    elif session[3] != 'voting':
         return
-    update_session_state(session_id, 'finished')
+    else:
+        update_session_state(session_id, 'finished')
     results = get_vote_results(session_id)
     if not results:
         return
@@ -2167,7 +2188,13 @@ async def finish_voting():
     update_leaderboard_sheet()
 
     text += f"\n📋 <a href='{sheet_url}'>Полная таблица лидеров</a>"
-    await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+    sent_results = await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+    if await bot_can_manage_pins(GROUP_ID):
+        try:
+            await bot.pin_chat_message(chat_id=GROUP_ID, message_id=sent_results.message_id, disable_notification=False)
+            set_group_pin(GROUP_ID, sent_results.message_id, "results_main", session_id)
+        except Exception as e:
+            logging.warning("Failed to pin results message: %r", e)
 
 # ==================== ХЭНДЛЕРЫ ====================
 
@@ -3541,13 +3568,16 @@ async def main():
     init_db()
     cleanup_expired_runtime_data()
     register_all_handlers(dp)
-    scheduler.add_job(start_collection, CronTrigger(day_of_week="wed", hour=10, minute=0))
-    scheduler.add_job(send_wednesday_reminder, CronTrigger(day_of_week="wed", hour=10, minute=0))
-    scheduler.add_job(send_collection_closing_reminder, CronTrigger(day_of_week="wed", hour=21, minute=0))
-    scheduler.add_job(start_voting, CronTrigger(day_of_week="wed", hour=22, minute=0))
-    scheduler.add_job(send_voting_closing_reminder, CronTrigger(day_of_week="thu", hour=11, minute=0))
-    scheduler.add_job(finish_voting, CronTrigger(day_of_week="thu", hour=12, minute=0))
-    scheduler.add_job(unpin_voting_message, CronTrigger(day_of_week="thu", hour=14, minute=0))
+    scheduler.add_job(start_collection, CronTrigger(day_of_week="wed", hour=10, minute=0), misfire_grace_time=3600)
+    scheduler.add_job(start_collection, CronTrigger(day_of_week="wed", hour=10, minute=10), misfire_grace_time=3600)  # retry
+    scheduler.add_job(send_wednesday_reminder, CronTrigger(day_of_week="wed", hour=10, minute=0), misfire_grace_time=3600)
+    scheduler.add_job(send_collection_closing_reminder, CronTrigger(day_of_week="wed", hour=21, minute=0), misfire_grace_time=3600)
+    scheduler.add_job(start_voting, CronTrigger(day_of_week="wed", hour=22, minute=0), misfire_grace_time=3600)
+    scheduler.add_job(start_voting, CronTrigger(day_of_week="wed", hour=22, minute=10), misfire_grace_time=3600)  # retry
+    scheduler.add_job(send_voting_closing_reminder, CronTrigger(day_of_week="thu", hour=11, minute=0), misfire_grace_time=3600)
+    scheduler.add_job(finish_voting, CronTrigger(day_of_week="thu", hour=12, minute=0), misfire_grace_time=3600)
+    scheduler.add_job(finish_voting, CronTrigger(day_of_week="thu", hour=12, minute=10), misfire_grace_time=3600)  # retry
+    scheduler.add_job(unpin_voting_message, CronTrigger(day_of_week="thu", hour=14, minute=0), misfire_grace_time=3600)
     scheduler.add_job(cleanup_runtime_data_job, IntervalTrigger(hours=1))
     scheduler.start()
     print("🎵 Track Day Bot запущен!")
