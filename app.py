@@ -2612,44 +2612,148 @@ async def menu_admin_button(message: Message):
 @dp.callback_query(F.data == "admin_themes")
 async def cb_admin_themes(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
         return
     await callback.answer()
-    await cmd_themes(callback.message)
+    total, unused = get_themes_count()
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить тему", callback_data="themes_add")],
+        [InlineKeyboardButton(text="📋 Просмотреть все темы", callback_data="themes_list_0")],
+        [InlineKeyboardButton(text="🗑 Удалить тему", callback_data="themes_delete_menu")],
+        [InlineKeyboardButton(text="🔄 Сбросить флаги использования", callback_data="themes_reset")],
+    ])
+    await callback.message.answer(
+        f"🎛 <b>Управление темами</b>\n\n"
+        f"📊 Всего тем: <b>{total}</b>\n"
+        f"✅ Неиспользованных: <b>{unused}</b>\n\n"
+        "Что хочешь сделать?",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
 
 @dp.callback_query(F.data == "admin_nominations")
 async def cb_admin_nominations(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
         return
     await callback.answer()
-    await cmd_nominations(callback.message)
+    nominations = get_nominations(active_only=False)
+    active_count = sum(1 for _, _, is_active in nominations if is_active)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➕ Добавить номинацию", callback_data="nom_add")],
+        [InlineKeyboardButton(text="📋 Список номинаций", callback_data="nom_list_0")],
+        [InlineKeyboardButton(text="🗑 Удалить номинацию", callback_data="nom_del_menu")],
+    ])
+    await callback.message.answer(
+        f"🏅 <b>Управление номинациями</b>\n\n"
+        f"Всего: <b>{len(nominations)}</b>\n"
+        f"Активных: <b>{active_count}</b>\n\n"
+        "Что делаем?",
+        reply_markup=keyboard,
+        parse_mode="HTML",
+    )
 
 @dp.callback_query(F.data == "admin_startcollection")
 async def cb_admin_startcollection(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
         return
     await callback.answer()
-    await cmd_force_start(callback.message)
+    try:
+        base_week = get_week_base()
+        active = get_active_week_session(base_week)
+        if active:
+            await callback.message.answer(f"⚠️ Сессия уже существует (состояние: {active[3]}). Сначала заверши текущую.")
+            return
+        theme = get_random_theme()
+        week_sessions = list_week_sessions(base_week)
+        if not week_sessions:
+            new_week = base_week
+        else:
+            suffix = next_week_suffix(base_week)
+            new_week = base_week if suffix is None else f"{base_week}-{suffix}"
+        session_id = create_session(theme, week_override=new_week)
+        conn = sqlite3.connect("trackday.db")
+        c = conn.cursor()
+        c.execute("SELECT * FROM sessions WHERE id = ?", (session_id,))
+        session = c.fetchone()
+        conn.close()
+        if session:
+            sheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
+            text = (
+                f"🎵 <b>TRACK DAY!</b>\n\n"
+                f"Тема этой недели: <b>{session[2]}</b>\n\n"
+                f"Скидывайте свои треки мне в <b>личку</b> (@track0_day_bot) до 22:00 🎧\n\n"
+                f"📌 Правила:\n"
+                f"• Один трек от каждого\n"
+                f"• Ссылка + можно описание почему именно этот\n"
+                f"• Треки будут анонимными до результатов\n\n"
+                f"🏆 <a href='{sheet_url}'>Таблица лидеров</a> | За участие: +1 очко"
+            )
+            await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+            await callback.message.answer(f"✅ Сбор треков запущен!\nНеделя: {session[1]}\nТема: {session[2]}")
+        else:
+            await callback.message.answer("❌ Ошибка — сессия не создалась. Проверь лог.")
+    except Exception as e:
+        await callback.message.answer(f"❌ Ошибка: {e}")
+        logging.error(f"cb_admin_startcollection error: {e}")
 
 @dp.callback_query(F.data == "admin_startvoting")
 async def cb_admin_startvoting(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
         return
     await callback.answer()
-    await cmd_force_voting(callback.message)
+    try:
+        session = get_current_session()
+        if not session:
+            await callback.message.answer("❌ Нет активной сессии. Сначала запусти сбор треков (⚙️ Управление → Запустить сбор).")
+            return
+        started, status = await start_voting()
+        if started:
+            await callback.message.answer("✅ Голосование запущено!")
+        elif status == "already_voting":
+            await callback.message.answer("⚠️ Голосование уже запущено.")
+        elif status == "already_finished":
+            await callback.message.answer("⚠️ Голосование уже завершено.")
+        elif status == "no_tracks":
+            await callback.message.answer("⚠️ Нет треков для голосования.")
+        else:
+            await callback.message.answer("⚠️ Запуск голосования недоступен в текущем состоянии сессии.")
+    except Exception as e:
+        await callback.message.answer(f"❌ Ошибка: {e}")
+        logging.error(f"cb_admin_startvoting error: {e}")
 
 @dp.callback_query(F.data == "admin_finishvoting")
 async def cb_admin_finishvoting(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
         return
     await callback.answer()
-    await cmd_force_finish(callback.message)
+    try:
+        session = get_current_session()
+        if not session:
+            await callback.message.answer("❌ Нет активной сессии.")
+            return
+        await finish_voting()
+        await callback.message.answer("✅ Голосование завершено!")
+    except Exception as e:
+        await callback.message.answer(f"❌ Ошибка: {e}")
+        logging.error(f"cb_admin_finishvoting error: {e}")
 
 @dp.callback_query(F.data == "admin_updatesheets")
 async def cb_admin_updatesheets(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
+        await callback.answer()
         return
     await callback.answer()
-    await cmd_update_sheets(callback.message)
+    try:
+        update_leaderboard_sheet()
+        sheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
+        await callback.message.answer(f"✅ Таблица обновлена! <a href='{sheet_url}'>Открыть</a>", parse_mode="HTML")
+    except Exception as e:
+        await callback.message.answer(f"❌ Ошибка: {e}")
+        logging.error(f"cb_admin_updatesheets error: {e}")
 
 
 @dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
