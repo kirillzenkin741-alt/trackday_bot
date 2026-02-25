@@ -2757,7 +2757,11 @@ async def handle_private_message(message: Message, state: FSMContext):
         await message.answer("Выбери вариант кнопками ниже.")
         return
     if current_state != SubmitStates.waiting_track_input.state:
-        await message.answer("Нажми «🎵 Отправить трек» чтобы скинуть трек.")
+        is_admin = user_id == ADMIN_ID
+        await message.answer(
+            "Выбери действие из меню 👇",
+            reply_markup=build_main_menu_keyboard(is_admin=is_admin),
+        )
         return
 
     data = await state.get_data()
