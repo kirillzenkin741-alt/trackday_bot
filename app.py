@@ -1828,8 +1828,22 @@ async def start_collection():
             f"• Треки будут анонимными до результатов\n\n"
             f"🏆 <a href='{sheet_url}'>Таблица лидеров</a> | За участие: +1 очко"
         )
-        await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+        sent = await bot.send_message(GROUP_ID, text, parse_mode="HTML")
         logging.info("start_collection: message sent to group")
+        if await bot_can_manage_pins(GROUP_ID):
+            stale = get_group_pin(GROUP_ID, pin_type="collection_main")
+            if stale:
+                try:
+                    await bot.unpin_chat_message(chat_id=GROUP_ID, message_id=stale["message_id"])
+                except Exception:
+                    pass
+                finally:
+                    delete_group_pin(GROUP_ID, pin_type="collection_main")
+            try:
+                await bot.pin_chat_message(chat_id=GROUP_ID, message_id=sent.message_id, disable_notification=False)
+                set_group_pin(GROUP_ID, sent.message_id, "collection_main", session_id)
+            except Exception as e:
+                logging.warning("Failed to pin collection message: %r", e)
     except Exception as e:
         logging.error(f"start_collection error: {e}")
 
@@ -2039,6 +2053,16 @@ async def start_voting():
         delete_group_pin(GROUP_ID, pin_type="voting_main")
         logging.warning("Skip pin voting message: insufficient rights in chat_id=%s", GROUP_ID)
         return True, "started"
+    # Снимаем старое закрепление сбора треков
+    collection_pin = get_group_pin(GROUP_ID, pin_type="collection_main")
+    if collection_pin:
+        try:
+            await bot.unpin_chat_message(chat_id=GROUP_ID, message_id=collection_pin["message_id"])
+        except Exception:
+            pass
+        finally:
+            delete_group_pin(GROUP_ID, pin_type="collection_main")
+    # Снимаем старое закрепление голосования (если было)
     stale_pin = get_group_pin(GROUP_ID, pin_type="voting_main")
     if stale_pin:
         try:
@@ -2048,7 +2072,7 @@ async def start_voting():
         finally:
             delete_group_pin(GROUP_ID, pin_type="voting_main")
     try:
-        await bot.pin_chat_message(chat_id=GROUP_ID, message_id=sent_main.message_id, disable_notification=True)
+        await bot.pin_chat_message(chat_id=GROUP_ID, message_id=sent_main.message_id, disable_notification=False)
         set_group_pin(GROUP_ID, sent_main.message_id, "voting_main", session_id)
     except Exception as e:
         logging.warning("Failed to pin voting message: chat_id=%s message_id=%s err=%r", GROUP_ID, sent_main.message_id, e)
