@@ -8,7 +8,6 @@ import logging
 import sqlite3
 import random
 import re
-import io
 import hashlib
 import aiohttp
 import gspread
@@ -24,13 +23,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-
-try:
-    import pytesseract
-    from PIL import Image
-except ImportError:
-    pytesseract = None
-    Image = None
 
 try:
     from transliterate import translit
@@ -141,15 +133,6 @@ API_CACHE_TTL_HOURS = 24
 API_CACHE_STALE_DAYS = 7
 SUBMIT_CANDIDATE_TTL_MINUTES = 15
 RETRY_DELAYS = (0.6, 1.2, 2.4)
-OCR_STOP_PHRASES = {
-    "мне нравится", "нравится", "поделиться", "скачать", "поиск", "библиотека", "главная",
-    "playlist", "radio", "my music", "home", "library", "search", "like", "liked",
-    "подкасты", "волна", "коллекция", "чарт", "рекомендации", "ваша музыка",
-}
-OCR_UI_SINGLE_TOKENS = {
-    "поиск", "главная", "радио", "библиотека", "плейлист", "плейлисты", "моя", "мне", "волна", "новое",
-    "search", "home", "radio", "library", "playlist", "playlists", "liked", "shuffle", "repeat",
-}
 
 RU_TO_LAT_MAP = {
     "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo", "ж": "zh", "з": "z",
@@ -167,8 +150,14 @@ LAT_TO_RU_CHAR = {
     "s": "с", "t": "т", "u": "у", "v": "в", "w": "в", "x": "кс", "y": "й", "z": "з",
 }
 
-MENU_SUBMIT_TEXT = "Отправить трек"
-MENU_HELP_TEXT = "Все команды"
+MENU_SUBMIT_TEXT = "🎵 Отправить трек"
+MENU_MY_TRACK_TEXT = "🎵 Мой трек"
+MENU_STATS_TEXT = "📊 Статистика"
+MENU_LEADERBOARD_TEXT = "🏆 Лидеры"
+MENU_HISTORY_TEXT = "📖 История"
+MENU_ADDTHEME_TEXT = "💡 Предложить тему"
+MENU_ADMIN_TEXT = "⚙️ Управление"
+MENU_CANCEL_TEXT = "❌ Отмена"
 
 
 def now_iso() -> str:
@@ -379,95 +368,6 @@ async def get_song_links(url: str) -> dict:
     )
 
 
-async def _fetch_ocr_text(image_bytes: bytes) -> str:
-    api_key = os.getenv("OCR_SPACE_API_KEY", "helloworld")
-    endpoint = "https://api.ocr.space/parse/image"
-    timeout = aiohttp.ClientTimeout(total=35)
-    form = aiohttp.FormData()
-    form.add_field("apikey", api_key)
-    form.add_field("language", "rus")
-    form.add_field("OCREngine", "2")
-    form.add_field("isOverlayRequired", "false")
-    form.add_field("file", image_bytes, filename="track.jpg", content_type="image/jpeg")
-    async with aiohttp.ClientSession(timeout=timeout) as session:
-        async with session.post(endpoint, data=form) as resp:
-            if resp.status != 200:
-                body = await resp.text()
-                logging.warning("OCR.Space non-200: status=%s body=%s", resp.status, body[:300])
-                raise ValueError(f"ocr_non_200_{resp.status}")
-            data = await resp.json(content_type=None)
-    results = data.get("ParsedResults") or []
-    if not results:
-        errors = data.get("ErrorMessage") or data.get("ErrorDetails") or ""
-        logging.warning("OCR.Space empty result: errors=%s", errors)
-        return ""
-    return (results[0].get("ParsedText", "") or "").strip()
-
-
-async def ocr_extract_text_from_image_bytes(image_bytes: bytes) -> str:
-    """OCR изображения через OCR.Space (нужен OCR_SPACE_API_KEY в env; fallback на demo key)."""
-    image_hash = hashlib.sha256(image_bytes).hexdigest()
-    cache_key = make_api_cache_key("ocr", image_hash)
-    return await fetch_with_cache(
-        provider="ocr",
-        cache_key=cache_key,
-        fetcher_callable=lambda: _fetch_ocr_text(image_bytes),
-        default_payload="",
-    )
-
-def _ocr_text_score(text: str) -> int:
-    if not text:
-        return 0
-    letters = re.findall(r"[A-Za-zА-Яа-я]", text)
-    words = re.findall(r"[A-Za-zА-Яа-я0-9]{2,}", text)
-    if not words:
-        return 0
-    score = len(letters) + len(words) * 3
-    lowered = normalize_query_text(text)
-    stop_hits = sum(1 for phrase in OCR_STOP_PHRASES if phrase in lowered)
-    return max(0, score - stop_hits * 8)
-
-
-def _is_weak_ocr_text(text: str) -> bool:
-    if not text:
-        return True
-    stripped = text.strip()
-    if len(stripped) < 6:
-        return True
-    if not re.search(r"[A-Za-zА-Яа-я]{2,}", stripped):
-        return True
-    return _ocr_text_score(stripped) < 20
-
-
-def _normalize_ocr_line(line: str) -> str:
-    line = re.sub(r"[^\w\s\-—:./&']", " ", line, flags=re.UNICODE)
-    line = re.sub(r"\s+", " ", line).strip(" -—:|")
-    return line
-
-
-def sanitize_ocr_line(line: str) -> str:
-    cleaned = _normalize_ocr_line(line or "")
-    if not cleaned:
-        return ""
-    for phrase in OCR_STOP_PHRASES:
-        cleaned = re.sub(re.escape(phrase), " ", cleaned, flags=re.IGNORECASE)
-    cleaned = _normalize_ocr_line(cleaned)
-    parts = cleaned.split()
-    while parts and normalize_query_text(parts[0]) in OCR_UI_SINGLE_TOKENS:
-        parts.pop(0)
-    while parts and normalize_query_text(parts[-1]) in OCR_UI_SINGLE_TOKENS:
-        parts.pop()
-    cleaned = _normalize_ocr_line(" ".join(parts))
-    if len(cleaned) < 2:
-        return ""
-    tokens = re.findall(r"[A-Za-zА-Яа-я0-9]{2,}", cleaned)
-    if not tokens:
-        return ""
-    alpha_tokens = [normalize_query_text(t) for t in re.findall(r"[A-Za-zА-Яа-я]+", cleaned)]
-    has_artist_title_shape = bool(re.search(r"\s[-—]\s|:", cleaned))
-    if alpha_tokens and all(t in OCR_UI_SINGLE_TOKENS for t in alpha_tokens) and len(alpha_tokens) <= 4 and not has_artist_title_shape:
-        return ""
-    return cleaned[:180]
 
 
 def _split_artist_title(query: str):
@@ -484,41 +384,6 @@ def _looks_like_artist_title(query: str) -> bool:
     return bool(artist and title)
 
 
-def extract_search_queries_from_ocr(ocr_text: str):
-    if not ocr_text:
-        return []
-    lines = []
-    for raw_line in ocr_text.splitlines():
-        line = sanitize_ocr_line(raw_line)
-        if line:
-            lines.append(line)
-
-    if not lines:
-        return []
-
-    queries = []
-    seen = set()
-
-    def add_query(q: str):
-        qn = normalize_query_text(q)
-        if not qn or qn in seen or len(qn) < 2:
-            return
-        seen.add(qn)
-        queries.append(q.strip()[:180])
-
-    for line in lines:
-        if _looks_like_artist_title(line):
-            add_query(line)
-    for line in lines:
-        if " - " in line or " — " in line or ":" in line:
-            candidate = re.sub(r"\s*[:]\s*", " - ", line)
-            add_query(candidate)
-    for idx in range(len(lines) - 1):
-        pair = f"{lines[idx]} - {lines[idx + 1]}"
-        add_query(pair)
-    for line in lines:
-        add_query(line)
-    return queries[:8]
 
 
 def _contains_cyrillic(text: str) -> bool:
@@ -702,57 +567,6 @@ async def search_track_candidates_multiquery(queries, limit: int = 3):
     return result
 
 
-async def ocr_extract_text_with_fallback(image_bytes: bytes) -> str:
-    primary_text = await ocr_extract_text_from_image_bytes(image_bytes)
-    if not _is_weak_ocr_text(primary_text):
-        return primary_text
-    if not pytesseract or not Image:
-        logging.warning("OCR fallback unavailable: pytesseract/Pillow not installed")
-        return primary_text
-    fallback_text = ""
-    try:
-        with Image.open(io.BytesIO(image_bytes)) as img:
-            try:
-                fallback_text = pytesseract.image_to_string(img, lang="rus+eng")
-            except Exception:
-                fallback_text = pytesseract.image_to_string(img, lang="eng")
-    except Exception as e:
-        logging.warning("OCR fallback failed: err=%r", e)
-        return primary_text
-    if not fallback_text:
-        return primary_text
-    logging.info("OCR fallback used (tesseract)")
-    return fallback_text if _ocr_text_score(fallback_text) >= _ocr_text_score(primary_text) else primary_text
-
-def parse_artist_title_from_ocr_text(ocr_text: str):
-    if not ocr_text:
-        return "", "", ""
-    lines = [ln.strip() for ln in ocr_text.splitlines() if ln.strip()]
-    cleaned = []
-    for ln in lines:
-        ln = re.sub(r"\s+", " ", ln)
-        if len(ln) < 2:
-            continue
-        cleaned.append(ln)
-    if not cleaned:
-        return "", "", ""
-    for ln in cleaned:
-        if " - " in ln or " — " in ln:
-            parts = re.split(r"\s[-—]\s", ln, maxsplit=1)
-            if len(parts) == 2:
-                artist = parts[0].strip(" -—")
-                title = parts[1].strip(" -—")
-                query = f"{artist} {title}".strip()
-                return artist, title, query
-    # fallback: используем первые 2 осмысленные строки
-    if len(cleaned) >= 2:
-        artist = cleaned[0][:100]
-        title = cleaned[1][:120]
-        query = f"{artist} {title}".strip()
-        return artist, title, query
-    # fallback: одна строка как общий query
-    q = cleaned[0][:180]
-    return "", "", q
 
 async def _fetch_itunes_candidates(query: str, limit: int = 3):
     timeout = aiohttp.ClientTimeout(total=20)
@@ -1849,15 +1663,41 @@ def build_mytrack_keyboard(session_id, allow_delete):
     )
 
 
-def build_main_menu_keyboard():
+def build_main_menu_keyboard(is_admin=False):
+    keyboard = [
+        [KeyboardButton(text=MENU_SUBMIT_TEXT)],
+        [KeyboardButton(text=MENU_MY_TRACK_TEXT)],
+        [KeyboardButton(text=MENU_STATS_TEXT)],
+        [KeyboardButton(text=MENU_LEADERBOARD_TEXT)],
+        [KeyboardButton(text=MENU_HISTORY_TEXT)],
+        [KeyboardButton(text=MENU_ADDTHEME_TEXT)],
+    ]
+    if is_admin:
+        keyboard.append([KeyboardButton(text=MENU_ADMIN_TEXT)])
     return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=MENU_SUBMIT_TEXT), KeyboardButton(text=MENU_HELP_TEXT)],
-        ],
+        keyboard=keyboard,
         resize_keyboard=True,
         is_persistent=True,
         input_field_placeholder="Выберите действие",
     )
+
+
+def build_cancel_keyboard():
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=MENU_CANCEL_TEXT)]],
+        resize_keyboard=True,
+    )
+
+
+def build_admin_panel_keyboard():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎛 Темы", callback_data="admin_themes")],
+        [InlineKeyboardButton(text="🏅 Номинации", callback_data="admin_nominations")],
+        [InlineKeyboardButton(text="▶️ Запустить сбор", callback_data="admin_startcollection")],
+        [InlineKeyboardButton(text="🗳 Запустить голосование", callback_data="admin_startvoting")],
+        [InlineKeyboardButton(text="✅ Завершить голосование", callback_data="admin_finishvoting")],
+        [InlineKeyboardButton(text="📊 Обновить таблицу", callback_data="admin_updatesheets")],
+    ])
 
 def get_vote_results(session_id):
     conn = sqlite3.connect("trackday.db")
@@ -1999,12 +1839,40 @@ async def send_wednesday_reminder():
             "⏰ <b>Напоминание Track Day</b>\n\n"
             "Сегодня <b>последний день</b>, когда можно отправить трек 🎵\n"
             "Голосование стартует уже <b>сегодня в 22:00</b> 🗳\n\n"
-            "Отправляйте треки мне в личку: /submit или кнопкой «Отправить трек»."
+            "Отправляйте треки мне в личку (@track0_day_bot) — кнопка «🎵 Отправить трек»."
         )
         await bot.send_message(GROUP_ID, text, parse_mode="HTML")
         logging.info("wednesday reminder sent to group")
     except Exception as e:
         logging.error("send_wednesday_reminder error: %r", e)
+
+
+async def send_collection_closing_reminder():
+    """Среда 21:00 — через час закроется приём треков и начнётся голосование."""
+    try:
+        text = (
+            "⏰ <b>Остался 1 час!</b>\n\n"
+            "В <b>22:00</b> приём треков закрывается и начинается голосование 🗳\n"
+            "Успей отправить свой трек — напиши боту в личку (@track0_day_bot), кнопка «🎵 Отправить трек»."
+        )
+        await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+        logging.info("collection closing reminder sent to group")
+    except Exception as e:
+        logging.error("send_collection_closing_reminder error: %r", e)
+
+
+async def send_voting_closing_reminder():
+    """Четверг 11:00 — через час закроется голосование."""
+    try:
+        text = (
+            "⏰ <b>Остался 1 час!</b>\n\n"
+            "В <b>12:00</b> голосование заканчивается 🗳\n"
+            "Успей проголосовать, если ещё не успел!"
+        )
+        await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+        logging.info("voting closing reminder sent to group")
+    except Exception as e:
+        logging.error("send_voting_closing_reminder error: %r", e)
 
 async def bot_can_manage_pins(chat_id):
     try:
@@ -2300,9 +2168,8 @@ async def on_bot_added_to_chat(event: ChatMemberUpdated):
             "• запускаю вечернее голосование,\n"
             "• считаю очки и веду историю победителей.\n\n"
             "Как участвовать:\n"
-            "• отправьте трек мне в личку через /submit,\n"
-            "• голосуйте в группе, когда откроется голосование.\n\n"
-            "Полезные команды: /leaderboard, /history, /help"
+            "• напишите мне в личку (@track0_day_bot) и нажмите кнопку «🎵 Отправить трек» в среду с 10:00 до 22:00,\n"
+            "• голосуйте в группе, когда откроется голосование."
         )
         await bot.send_message(chat_id, text, parse_mode="HTML")
         mark_group_welcomed(chat_id)
@@ -2312,22 +2179,12 @@ async def on_bot_added_to_chat(event: ChatMemberUpdated):
 @dp.message(Command("start"))
 async def cmd_start(message: Message):
     sheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
-    menu_markup = build_main_menu_keyboard() if message.chat.type == "private" else None
-    if message.from_user.id == ADMIN_ID:
+    is_admin = message.from_user.id == ADMIN_ID
+    menu_markup = build_main_menu_keyboard(is_admin=is_admin) if message.chat.type == "private" else None
+    if is_admin:
         await message.answer(
             "👋 Привет, админ! Я бот для <b>Track Day</b>!\n\n"
-            "📌 Команды:\n"
-            "/submit — скинуть трек\n"
-            "/mytrack — мой трек этой недели\n"
-            "/themes — управление темами 🔒\n"
-            "/nominations — управление номинациями 🏅\n"
-            "/leaderboard — таблица лидеров\n"
-            "/history — история победителей\n"
-            "/mystats — твоя статистика\n"
-            "/startcollection — запустить сбор вручную\n"
-            "/startvoting — запустить голосование вручную\n"
-            "/finishvoting — завершить голосование вручную\n"
-            "/updatesheets — обновить Google таблицу\n\n"
+            "Используй кнопки меню ниже для управления ботом.\n\n"
             f"📊 <a href='{sheet_url}'>Таблица лидеров онлайн</a>",
             parse_mode="HTML",
             reply_markup=menu_markup,
@@ -2336,14 +2193,7 @@ async def cmd_start(message: Message):
         await message.answer(
             "👋 Привет! Я бот для <b>Track Day</b>!\n\n"
             "Каждую среду мы выбираем лучший трек недели 🎵\n\n"
-            "📌 Команды:\n"
-            "/submit — скинуть трек (работает в личке)\n"
-            "/mytrack — мой трек этой недели\n"
-            "/addtheme — предложить тему недели 💡\n"
-            "/leaderboard — таблица лидеров\n"
-            "/history — история победителей\n"
-            "/mystats — твоя статистика\n"
-            "/help — помощь\n\n"
+            "Используй кнопки меню ниже 👇\n\n"
             f"📊 <a href='{sheet_url}'>Таблица лидеров онлайн</a>",
             parse_mode="HTML",
             reply_markup=menu_markup,
@@ -2351,34 +2201,14 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    if message.from_user.id == ADMIN_ID:
-        text = (
-            "🛠 <b>Команды админа</b>\n\n"
-            "/submit — отправить трек в текущую сессию\n"
-            "/mytrack — посмотреть/изменить свой трек\n"
-            "/themes — управление темами\n"
-            "/nominations — управление номинациями\n"
-            "/leaderboard — таблица лидеров\n"
-            "/history — история победителей\n"
-            "/mystats — твоя статистика\n"
-            "/startcollection — запустить сбор вручную\n"
-            "/startvoting — запустить голосование вручную\n"
-            "/finishvoting — завершить голосование вручную\n"
-            "/updatesheets — обновить Google таблицу\n"
-            "/help — показать список команд"
-        )
-    else:
-        text = (
-            "🎵 <b>Команды участника</b>\n\n"
-            "/submit — отправить трек (в личке)\n"
-            "/mytrack — посмотреть/изменить свой трек\n"
-            "/addtheme — предложить тему\n"
-            "/leaderboard — таблица лидеров\n"
-            "/history — история победителей\n"
-            "/mystats — твоя статистика\n"
-            "/help — показать список команд"
-        )
-    await message.answer(text, parse_mode="HTML")
+    is_admin = message.from_user.id == ADMIN_ID
+    menu_markup = build_main_menu_keyboard(is_admin=is_admin) if message.chat.type == "private" else None
+    text = (
+        "🎵 <b>Track Day</b>\n\n"
+        "Используй кнопки меню для навигации.\n"
+        "Приём треков — только в среду с 10:00 до 22:00."
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=menu_markup)
 
 # ==================== УПРАВЛЕНИЕ ТЕМАМИ (только для админа) ====================
 @dp.message(Command("themes"))
@@ -2413,9 +2243,9 @@ async def themes_add_start(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(
         "✏️ Напиши новую тему и отправь мне.\n\n"
         "Можно добавить эмодзи в начале, например:\n"
-        "<i>🔥 Трек который слушаешь перед важным делом</i>\n\n"
-        "Для отмены напиши /cancel",
-        parse_mode="HTML"
+        "<i>🔥 Трек который слушаешь перед важным делом</i>",
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(),
     )
     await callback.answer()
 
@@ -2467,9 +2297,9 @@ async def themes_delete_menu(callback: CallbackQuery, state: FSMContext):
     await state.set_state(ThemeStates.waiting_delete_theme_id)
     await callback.message.answer(
         "🗑 Напиши <b>номер темы</b> которую хочешь удалить.\n"
-        "Номер можно найти в списке тем (команда /themes → Просмотреть все).\n\n"
-        "Для отмены напиши /cancel",
-        parse_mode="HTML"
+        "Номер можно найти в списке тем (кнопка «Просмотреть все темы»).",
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(),
     )
     await callback.answer()
 
@@ -2535,8 +2365,9 @@ async def nominations_add_start(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(NominationStates.waiting_nomination_name)
     await callback.message.answer(
-        "✏️ Напиши название новой номинации.\n\nДля отмены: /cancel",
-        parse_mode="HTML"
+        "✏️ Напиши название новой номинации.",
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(),
     )
     await callback.answer()
 
@@ -2601,8 +2432,9 @@ async def nominations_delete_menu(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(NominationStates.waiting_nomination_delete_id)
     await callback.message.answer(
-        "🗑 Напиши <b>номер номинации</b> из списка /nominations.",
-        parse_mode="HTML"
+        "🗑 Напиши <b>номер номинации</b> из списка (кнопка «📋 Список номинаций»).",
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(),
     )
     await callback.answer()
 
@@ -2628,15 +2460,20 @@ async def nominations_back(callback: CallbackQuery):
     await callback.answer()
 
 @dp.message(Command("cancel"))
+@dp.message(F.chat.type == "private", F.text == MENU_CANCEL_TEXT)
 async def cmd_cancel(message: Message, state: FSMContext):
     current_state = await state.get_state()
+    is_admin = message.from_user.id == ADMIN_ID
+    menu = build_main_menu_keyboard(is_admin=is_admin)
     if current_state:
         data = await state.get_data()
         pending_token = data.get("pending_token")
         if pending_token:
             delete_submit_candidates(pending_token)
         await state.clear()
-        await message.answer("❌ Отменено.")
+        await message.answer("❌ Отменено.", reply_markup=menu)
+    else:
+        await message.answer("Нет активного действия для отмены.", reply_markup=menu)
 
 # ==================== SUBMIT ====================
 
@@ -2656,9 +2493,6 @@ async def build_candidates_for_input(source_type: str, raw_value: str):
         return [candidate]
     if source_type == "text":
         return await search_track_candidates_multiquery([raw_value], limit=3)
-    if source_type == "photo":
-        queries = extract_search_queries_from_ocr(raw_value)
-        return await search_track_candidates_multiquery(queries, limit=3)
     return []
 
 
@@ -2696,15 +2530,23 @@ async def cmd_addtheme(message: Message, state: FSMContext):
     await message.answer(
         "✏️ Напиши тему и отправь мне!\n\n"
         "Просто текст без эмодзи, например:\n"
-        "<i>Песня которую слушал в детстве</i>\n\n"
-        "Для отмены: /cancel",
-        parse_mode="HTML"
+        "<i>Песня которую слушал в детстве</i>",
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(),
     )
 
 @dp.message(Command("submit"))
 async def cmd_submit(message: Message, state: FSMContext):
     if message.chat.type != "private":
         await message.answer("📩 Треки принимаю только в личке! Напиши мне сюда: @track0_day_bot")
+        return
+    now = datetime.now()
+    if now.weekday() != 2 or now.hour < 10 or now.hour >= 22:
+        await message.answer(
+            "⏰ Приём треков открыт только в <b>среду с 10:00 до 22:00</b>.\n"
+            "Возвращайся в следующую среду!",
+            parse_mode="HTML"
+        )
         return
     session, created_now, status = get_or_create_collecting_session_for_submit()
     if status == "voting":
@@ -2727,8 +2569,7 @@ async def cmd_submit(message: Message, state: FSMContext):
     await message.answer(
         f"🎵 Тема недели: <b>{session[2]}</b>\n\n"
         "Пришли ссылку на трек (Spotify, YouTube, VK Music, Tidal — любая)\n"
-        "Или просто напиши название трека (например: Rick Astley - Never Gonna Give You Up)\n"
-        "Или отправь скриншот с треком — я попробую распознать и найти варианты 👇",
+        "Или просто напиши название трека (например: Rick Astley - Never Gonna Give You Up) 👇",
         parse_mode="HTML"
     )
     old_data = await state.get_data()
@@ -2742,10 +2583,73 @@ async def cmd_submit(message: Message, state: FSMContext):
 async def menu_submit_button(message: Message, state: FSMContext):
     await cmd_submit(message, state)
 
+@dp.message(F.chat.type == "private", F.text == MENU_MY_TRACK_TEXT)
+async def menu_mytrack_button(message: Message):
+    await cmd_mytrack(message)
 
-@dp.message(F.chat.type == "private", F.text == MENU_HELP_TEXT)
-async def menu_help_button(message: Message):
-    await cmd_help(message)
+@dp.message(F.chat.type == "private", F.text == MENU_STATS_TEXT)
+async def menu_stats_button(message: Message):
+    await cmd_mystats(message)
+
+@dp.message(F.chat.type == "private", F.text == MENU_LEADERBOARD_TEXT)
+async def menu_leaderboard_button(message: Message):
+    await cmd_leaderboard(message)
+
+@dp.message(F.chat.type == "private", F.text == MENU_HISTORY_TEXT)
+async def menu_history_button(message: Message):
+    await cmd_history(message)
+
+@dp.message(F.chat.type == "private", F.text == MENU_ADDTHEME_TEXT)
+async def menu_addtheme_button(message: Message, state: FSMContext):
+    await cmd_addtheme(message, state)
+
+@dp.message(F.chat.type == "private", F.text == MENU_ADMIN_TEXT)
+async def menu_admin_button(message: Message):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await message.answer("⚙️ <b>Панель управления</b>", parse_mode="HTML", reply_markup=build_admin_panel_keyboard())
+
+@dp.callback_query(F.data == "admin_themes")
+async def cb_admin_themes(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await callback.answer()
+    await cmd_themes(callback.message)
+
+@dp.callback_query(F.data == "admin_nominations")
+async def cb_admin_nominations(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await callback.answer()
+    await cmd_nominations(callback.message)
+
+@dp.callback_query(F.data == "admin_startcollection")
+async def cb_admin_startcollection(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await callback.answer()
+    await cmd_force_start(callback.message)
+
+@dp.callback_query(F.data == "admin_startvoting")
+async def cb_admin_startvoting(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await callback.answer()
+    await cmd_force_voting(callback.message)
+
+@dp.callback_query(F.data == "admin_finishvoting")
+async def cb_admin_finishvoting(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await callback.answer()
+    await cmd_force_finish(callback.message)
+
+@dp.callback_query(F.data == "admin_updatesheets")
+async def cb_admin_updatesheets(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await callback.answer()
+    await cmd_update_sheets(callback.message)
 
 
 @dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
@@ -2757,7 +2661,7 @@ async def handle_private_message(message: Message, state: FSMContext):
     # Обработка добавления темы
     if current_state == ThemeStates.waiting_theme_admin.state and user_id == ADMIN_ID:
         if not message_text:
-            await message.answer("❌ Тема не должна быть пустой. Напиши текст темы или /cancel")
+            await message.answer("❌ Тема не должна быть пустой. Напиши текст темы или нажми «❌ Отмена».")
             return
         theme_with_emoji = add_emoji_to_theme(message_text)
         if add_theme_to_db(theme_with_emoji, user_id=user_id, user_name=message.from_user.full_name):
@@ -2765,30 +2669,32 @@ async def handle_private_message(message: Message, state: FSMContext):
             await message.answer(
                 f"✅ Тема добавлена!\n\n<b>{theme_with_emoji}</b>\n\n"
                 f"Всего тем: {total} | Неиспользованных: {unused}\n\n"
-                f"Пиши следующую тему или /cancel для выхода",
+                "Пиши следующую тему или нажми «❌ Отмена» для выхода.",
                 parse_mode="HTML"
             )
         else:
-            await message.answer("❌ Такая тема уже есть! Пиши следующую или /cancel")
+            await message.answer("❌ Такая тема уже есть! Пиши следующую или нажми «❌ Отмена».")
         return
 
     if current_state == ThemeStates.waiting_theme_user.state:
         if not message_text:
-            await message.answer("❌ Тема не должна быть пустой. Напиши текст темы или /cancel")
+            await message.answer("❌ Тема не должна быть пустой. Напиши текст темы или нажми «❌ Отмена».")
             return
         if len(message_text) < 5:
             await message.answer("❌ Тема слишком короткая. Нужно минимум 5 символов.")
             return
         theme_with_emoji = add_emoji_to_theme(message_text)
         if add_theme_to_db(theme_with_emoji, user_id=user_id, user_name=message.from_user.full_name):
+            is_admin = user_id == ADMIN_ID
             await message.answer(
                 f"✅ Тема принята!\n\n<b>{theme_with_emoji}</b>\n\n"
                 "Спасибо за идею 💡",
-                parse_mode="HTML"
+                parse_mode="HTML",
+                reply_markup=build_main_menu_keyboard(is_admin=is_admin),
             )
             await state.clear()
         else:
-            await message.answer("❌ Такая тема уже есть! Попробуй другую или /cancel")
+            await message.answer("❌ Такая тема уже есть! Попробуй другую или нажми «❌ Отмена».")
         return
 
     if current_state == NominationStates.waiting_nomination_name.state and user_id == ADMIN_ID:
@@ -2801,7 +2707,7 @@ async def handle_private_message(message: Message, state: FSMContext):
         if add_nomination(message_text):
             await message.answer(
                 f"✅ Номинация добавлена: <b>{message_text}</b>\n\n"
-                "Добавь следующую или /cancel",
+                "Добавь следующую или нажми «❌ Отмена».",
                 parse_mode="HTML"
             )
         else:
@@ -2837,28 +2743,28 @@ async def handle_private_message(message: Message, state: FSMContext):
                 await message.answer(
                     f"✅ Тема #{seq_num} удалена:\n<i>{theme_text}</i>\n\n"
                     f"Осталось тем: {total}\n"
-                    f"Ещё удалить? Пиши номер или /cancel",
+                    "Ещё удалить? Пиши номер или нажми «❌ Отмена».",
                     parse_mode="HTML"
                 )
             else:
-                await message.answer("❌ Темы с таким номером нет. Проверь список /themes → Просмотреть все")
+                await message.answer("❌ Темы с таким номером нет. Проверь список через кнопку «📋 Просмотреть все темы».")
         except ValueError:
             await message.answer("❌ Введи число — порядковый номер из списка.")
         return
 
     # Обработка трека
     if current_state in (SubmitStates.waiting_candidate_choice.state, SubmitStates.waiting_confirmation.state):
-        await message.answer("Выбери вариант кнопками ниже или нажми /cancel.")
+        await message.answer("Выбери вариант кнопками ниже.")
         return
     if current_state != SubmitStates.waiting_track_input.state:
-        await message.answer("Напиши /submit чтобы скинуть трек, или /help для помощи")
+        await message.answer("Нажми «🎵 Отправить трек» чтобы скинуть трек.")
         return
 
     data = await state.get_data()
     session_id = data.get("session_id")
     if not session_id:
         await state.clear()
-        await message.answer("❌ Сессия отправки устарела. Напиши /submit снова.")
+        await message.answer("❌ Сессия отправки устарела. Нажми «🎵 Отправить трек» снова.")
         return
     session_row = get_current_session()
     if not session_row or session_row[0] != session_id or session_row[3] != "collecting":
@@ -2875,7 +2781,7 @@ async def handle_private_message(message: Message, state: FSMContext):
             if pending_token:
                 delete_submit_candidates(pending_token)
             await state.clear()
-            await message.answer("❌ Не удалось восстановить сессию отправки. Напиши /submit снова.")
+            await message.answer("❌ Не удалось восстановить сессию отправки. Нажми «🎵 Отправить трек» снова.")
             return
         session_id = rebound_session[0]
         await state.update_data(session_id=session_id)
@@ -2891,7 +2797,7 @@ async def handle_private_message(message: Message, state: FSMContext):
         if pending_token:
             delete_submit_candidates(pending_token)
         await state.clear()
-        await message.answer("❌ Сессия отправки недоступна. Напиши /submit снова.")
+        await message.answer("❌ Сессия отправки недоступна. Нажми «🎵 Отправить трек» снова.")
         return
 
     text = message.text or ""
@@ -2930,90 +2836,6 @@ async def handle_private_message(message: Message, state: FSMContext):
         candidates=candidates[:3],
     )
 
-@dp.message(F.chat.type == "private", F.photo)
-async def handle_private_photo(message: Message, state: FSMContext):
-    current_state = await state.get_state()
-    if current_state != SubmitStates.waiting_track_input.state:
-        return
-    data = await state.get_data()
-    session_id = data.get("session_id")
-    if not session_id:
-        await state.clear()
-        await message.answer("❌ Сессия отправки устарела. Напиши /submit снова.")
-        return
-    session_row = get_current_session()
-    if not session_row or session_row[0] != session_id or session_row[3] != "collecting":
-        rebound_session, created_now, status = get_or_create_collecting_session_for_submit()
-        if status == "voting":
-            pending_token = data.get("pending_token")
-            if pending_token:
-                delete_submit_candidates(pending_token)
-            await state.clear()
-            await message.answer("⏰ Приём треков уже закрыт, идёт голосование!")
-            return
-        if not rebound_session:
-            pending_token = data.get("pending_token")
-            if pending_token:
-                delete_submit_candidates(pending_token)
-            await state.clear()
-            await message.answer("❌ Не удалось восстановить сессию отправки. Напиши /submit снова.")
-            return
-        session_id = rebound_session[0]
-        await state.update_data(session_id=session_id)
-        if created_now:
-            await message.answer(
-                f"✅ Открыл новый сбор треков: <b>{rebound_session[1]}</b>\n"
-                f"Тема: <b>{rebound_session[2]}</b>",
-                parse_mode="HTML",
-            )
-    session_row = get_current_session()
-    if not session_row or session_row[0] != session_id or session_row[3] != "collecting":
-        pending_token = data.get("pending_token")
-        if pending_token:
-            delete_submit_candidates(pending_token)
-        await state.clear()
-        await message.answer("❌ Сессия отправки недоступна. Напиши /submit снова.")
-        return
-
-    try:
-        await message.answer("🧠 Смотрю скриншот, распознаю текст и ищу варианты...")
-        photo = message.photo[-1]
-        file = await bot.get_file(photo.file_id)
-        bio = io.BytesIO()
-        await bot.download_file(file.file_path, destination=bio)
-        image_bytes = bio.getvalue()
-
-        ocr_text = await ocr_extract_text_with_fallback(image_bytes)
-        queries = extract_search_queries_from_ocr(ocr_text)
-        if not queries:
-            await message.answer("❌ Не смог распознать трек на скриншоте. Пришли ссылку или более четкий скрин.")
-            return
-
-        candidates = await build_candidates_for_input("photo", ocr_text)
-        if not candidates:
-            await message.answer(
-                "❌ Не нашел трек по скриншоту. Попробуй формат: исполнитель - название, "
-                "или отправь ссылку вручную."
-            )
-            return
-
-        description = (message.caption or "").strip()
-        query_text = queries[0]
-        await send_candidates_prompt(
-            message=message,
-            state=state,
-            session_id=session_id,
-            source_type="photo",
-            query_text=query_text,
-            description=description,
-            candidates=candidates[:3],
-        )
-    except Exception as e:
-        logging.error("Photo submit failed: user_id=%s err=%r", message.from_user.id, e)
-        await message.answer(
-            "⚠️ Не удалось обработать скриншот из-за сетевой ошибки. "
-            "Попробуй еще раз или отправь ссылку на трек."
-        )
 
 @dp.callback_query(F.data.startswith("cand_"))
 async def handle_candidate_pick(callback: CallbackQuery, state: FSMContext):
@@ -3029,7 +2851,7 @@ async def handle_candidate_pick(callback: CallbackQuery, state: FSMContext):
     pending = get_submit_candidates(token)
     if not pending:
         await state.clear()
-        await callback.answer("Время выбора истекло. Отправь /submit снова.", show_alert=True)
+        await callback.answer("Время выбора истекло. Нажми «🎵 Отправить трек» снова.", show_alert=True)
         return
     if pending["user_id"] != callback.from_user.id:
         await callback.answer("Это не твой выбор трека.", show_alert=True)
@@ -3062,7 +2884,7 @@ async def handle_candidate_retry(callback: CallbackQuery, state: FSMContext):
     pending = get_submit_candidates(token)
     if not pending:
         await state.clear()
-        await callback.answer("Время выбора истекло. Отправь /submit снова.", show_alert=True)
+        await callback.answer("Время выбора истекло. Нажми «🎵 Отправить трек» снова.", show_alert=True)
         return
     if pending["user_id"] != callback.from_user.id:
         await callback.answer("Это не твой выбор трека.", show_alert=True)
@@ -3096,7 +2918,7 @@ async def handle_submit_cancel(callback: CallbackQuery, state: FSMContext):
         return
     delete_submit_candidates(token)
     await state.clear()
-    await callback.message.answer("❌ Отправка трека отменена. Чтобы начать заново: /submit")
+    await callback.message.answer("❌ Отправка трека отменена. Нажми «🎵 Отправить трек» чтобы начать заново.")
     await callback.answer("Отменено")
 
 
@@ -3110,7 +2932,7 @@ async def handle_submit_confirm(callback: CallbackQuery, state: FSMContext):
     pending = get_submit_candidates(token)
     if not pending:
         await state.clear()
-        await callback.answer("Время подтверждения истекло. Отправь /submit снова.", show_alert=True)
+        await callback.answer("Время подтверждения истекло. Нажми «🎵 Отправить трек» снова.", show_alert=True)
         return
     if pending["user_id"] != callback.from_user.id:
         await callback.answer("Это не твоя заявка.", show_alert=True)
@@ -3177,7 +2999,7 @@ async def handle_submit_confirm(callback: CallbackQuery, state: FSMContext):
 @dp.message(Command("mytrack"))
 async def cmd_mytrack(message: Message):
     if message.chat.type != "private":
-        await message.answer("📩 Команда /mytrack доступна только в личке с ботом.")
+        await message.answer("📩 Эта функция доступна только в личке с ботом.")
         return
     session = get_current_session()
     if not session:
@@ -3185,7 +3007,7 @@ async def cmd_mytrack(message: Message):
         return
     track = get_user_track_in_session(message.from_user.id, session[0])
     if not track:
-        await message.answer("У тебя пока нет трека в текущей сессии. Используй /submit")
+        await message.answer("У тебя пока нет трека в текущей сессии. Нажми «🎵 Отправить трек».")
         return
     label = format_track_label(track[10] if len(track) > 10 else "", track[9] if len(track) > 9 else "", fallback=track[5])
     description = (track[6] or "").strip()
@@ -3252,7 +3074,7 @@ async def cb_mytrack_delete(callback: CallbackQuery, state: FSMContext):
         delete_submit_candidates(pending_token)
     await state.clear()
     if deleted:
-        await callback.message.answer("🗑 Твой трек удалён. Можешь отправить новый через /submit")
+        await callback.message.answer("🗑 Твой трек удалён. Можешь отправить новый — нажми «🎵 Отправить трек».")
         await callback.answer("Удалено")
     else:
         await callback.answer("Трек не найден", show_alert=True)
@@ -3543,7 +3365,7 @@ async def cmd_force_voting(message: Message):
     try:
         session = get_current_session()
         if not session:
-            await message.answer("❌ Нет активной сессии. Сначала /startcollection")
+            await message.answer("❌ Нет активной сессии. Сначала запусти сбор треков (⚙️ Управление → Запустить сбор).")
             return
         started, status = await start_voting()
         if started:
@@ -3590,7 +3412,9 @@ async def main():
     register_all_handlers(dp)
     scheduler.add_job(start_collection, CronTrigger(day_of_week="wed", hour=10, minute=0))
     scheduler.add_job(send_wednesday_reminder, CronTrigger(day_of_week="wed", hour=10, minute=0))
+    scheduler.add_job(send_collection_closing_reminder, CronTrigger(day_of_week="wed", hour=21, minute=0))
     scheduler.add_job(start_voting, CronTrigger(day_of_week="wed", hour=22, minute=0))
+    scheduler.add_job(send_voting_closing_reminder, CronTrigger(day_of_week="thu", hour=11, minute=0))
     scheduler.add_job(finish_voting, CronTrigger(day_of_week="thu", hour=12, minute=0))
     scheduler.add_job(cleanup_runtime_data_job, IntervalTrigger(hours=1))
     scheduler.start()
