@@ -684,6 +684,67 @@ def add_week_to_history(week, theme, winner_name, track_url, votes, participants
     except Exception as e:
         logging.error(f"Error adding history: {e}")
 
+def sync_history_to_sheets():
+    """Добавляет в лист '📅 История' все завершённые сессии, которых там ещё нет.
+    Возвращает (added_count, error_str_or_None)."""
+    try:
+        client = get_sheets_client()
+        if not client:
+            return 0, "нет подключения к Google Sheets (проверь credentials.json)"
+        spreadsheet = client.open_by_key(SPREADSHEET_ID)
+        try:
+            history_sheet = spreadsheet.worksheet("📅 История")
+        except Exception:
+            history_sheet = spreadsheet.add_worksheet("📅 История", 1000, 10)
+            history_sheet.update("A1:F1", [["Неделя", "Тема", "Победитель", "Трек", "Голосов", "Участников"]])
+
+        # Читаем уже существующие недели (столбец A), чтобы не дублировать
+        existing_data = history_sheet.get_all_values()
+        existing_weeks = {row[0] for row in existing_data[1:] if row and row[0]}
+
+        conn = sqlite3.connect("trackday.db")
+        c = conn.cursor()
+        c.execute("SELECT id, week, theme FROM sessions WHERE state = 'finished' ORDER BY id")
+        sessions = c.fetchall()
+
+        added = 0
+        for session_id, week, theme in sessions:
+            if week in existing_weeks:
+                continue
+
+            # Участников
+            c.execute("SELECT COUNT(*) FROM tracks WHERE session_id = ?", (session_id,))
+            track_count = c.fetchone()[0]
+
+            # Победитель номинации с наибольшим количеством голосов
+            c.execute("""
+                SELECT snw.nomination_name_snapshot, t.full_name, t.track_url, snw.votes
+                FROM session_nomination_winners snw
+                JOIN tracks t ON t.id = snw.track_id
+                WHERE snw.session_id = ?
+                ORDER BY snw.votes DESC
+                LIMIT 1
+            """, (session_id,))
+            winner_row = c.fetchone()
+
+            if winner_row:
+                nom_name, winner_name, track_url, votes = winner_row
+                winner_display = f"{winner_name} ({nom_name})"
+            else:
+                winner_display = "—"
+                track_url = "—"
+                votes = 0
+
+            history_sheet.append_row([week, theme, winner_display, track_url, votes, track_count])
+            existing_weeks.add(week)
+            added += 1
+
+        conn.close()
+        return added, None
+    except Exception as e:
+        logging.error(f"sync_history_to_sheets error: {e}")
+        return 0, str(e)
+
 # ==================== БАЗА ДАННЫХ ====================
 def ensure_column(conn, table, column, ddl):
     c = conn.cursor()
@@ -2947,8 +3008,20 @@ async def cb_admin_updatesheets(callback: CallbackQuery):
     await callback.answer()
     try:
         update_leaderboard_sheet()
+        added, err = sync_history_to_sheets()
         sheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
-        await callback.message.answer(f"✅ Таблица обновлена! <a href='{sheet_url}'>Открыть</a>", parse_mode="HTML")
+        if err:
+            await callback.message.answer(
+                f"⚠️ Лидерборд обновлён, но история не синхронизировалась: {err}\n"
+                f"<a href='{sheet_url}'>Открыть таблицу</a>",
+                parse_mode="HTML"
+            )
+        else:
+            hint = f" (+{added} новых записей в историю)" if added else " (история уже актуальна)"
+            await callback.message.answer(
+                f"✅ Таблицы обновлены{hint}! <a href='{sheet_url}'>Открыть</a>",
+                parse_mode="HTML"
+            )
     except Exception as e:
         await callback.message.answer(f"❌ Ошибка: {e}")
         logging.error(f"cb_admin_updatesheets error: {e}")
@@ -3800,8 +3873,20 @@ async def cmd_update_sheets(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
     update_leaderboard_sheet()
+    added, err = sync_history_to_sheets()
     sheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
-    await message.answer(f"✅ Таблица обновлена! <a href='{sheet_url}'>Открыть</a>", parse_mode="HTML")
+    if err:
+        await message.answer(
+            f"⚠️ Лидерборд обновлён, но история не синхронизировалась: {err}\n"
+            f"<a href='{sheet_url}'>Открыть таблицу</a>",
+            parse_mode="HTML"
+        )
+    else:
+        hint = f" (+{added} новых записей в историю)" if added else " (история уже актуальна)"
+        await message.answer(
+            f"✅ Таблицы обновлены{hint}! <a href='{sheet_url}'>Открыть</a>",
+            parse_mode="HTML"
+        )
 
 # ==================== ЗАПУСК ====================
 async def main():
