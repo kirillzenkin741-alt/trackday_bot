@@ -12,6 +12,7 @@ import hashlib
 import aiohttp
 import gspread
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit, urlunsplit
 from google.oauth2.service_account import Credentials
 from aiogram import Bot, Dispatcher, F
@@ -870,6 +871,14 @@ def init_db():
         c.execute("ALTER TABLE nominations ADD COLUMN points INTEGER NOT NULL DEFAULT 1")
     except sqlite3.OperationalError:
         pass
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS sent_events (
+            event_name TEXT NOT NULL,
+            week TEXT NOT NULL,
+            sent_at TEXT NOT NULL,
+            PRIMARY KEY (event_name, week)
+        )
+    """)
     conn.commit()
     conn.close()
 
@@ -911,6 +920,41 @@ def delete_theme_from_db(theme_id):
     conn = sqlite3.connect("trackday.db")
     c = conn.cursor()
     c.execute("DELETE FROM themes WHERE id = ?", (theme_id,))
+    conn.commit()
+    conn.close()
+
+def toggle_theme_used(theme_id):
+    """Переключает флаг used у темы. Возвращает новое значение (0 или 1) или None если не найдена."""
+    conn = sqlite3.connect("trackday.db")
+    c = conn.cursor()
+    c.execute("SELECT used FROM themes WHERE id = ?", (theme_id,))
+    row = c.fetchone()
+    if row:
+        new_used = 0 if row[0] else 1
+        c.execute("UPDATE themes SET used = ? WHERE id = ?", (new_used, theme_id))
+        conn.commit()
+        conn.close()
+        return new_used
+    conn.close()
+    return None
+
+def is_event_sent(event_name: str, week: str) -> bool:
+    """Проверяет, было ли уже отправлено событие для данной недели."""
+    conn = sqlite3.connect("trackday.db")
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM sent_events WHERE event_name = ? AND week = ?", (event_name, week))
+    result = c.fetchone() is not None
+    conn.close()
+    return result
+
+def mark_event_sent(event_name: str, week: str):
+    """Помечает событие как отправленное для данной недели."""
+    conn = sqlite3.connect("trackday.db")
+    c = conn.cursor()
+    c.execute(
+        "INSERT OR IGNORE INTO sent_events (event_name, week, sent_at) VALUES (?, ?, ?)",
+        (event_name, week, datetime.now().isoformat())
+    )
     conn.commit()
     conn.close()
 
@@ -1816,6 +1860,9 @@ def get_track_user_id(track_id):
 async def start_collection():
     try:
         base_week = get_week_base()
+        if is_event_sent("start_collection", base_week):
+            logging.info("start_collection: already sent this week, skipping")
+            return
         active = get_active_week_session(base_week)
         if active:
             # Сессия уже есть — проверяем, было ли отправлено объявление
@@ -1848,6 +1895,7 @@ async def start_collection():
             f"🏆 <a href='{sheet_url}'>Таблица лидеров</a> | За участие: +1 очко"
         )
         sent = await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+        mark_event_sent("start_collection", base_week)
         logging.info("start_collection: message sent to group")
         if await bot_can_manage_pins(GROUP_ID):
             stale = get_group_pin(GROUP_ID, pin_type="collection_main")
@@ -1883,12 +1931,17 @@ async def send_wednesday_reminder():
 async def send_collection_closing_reminder():
     """Среда 21:00 — через час закроется приём треков и начнётся голосование."""
     try:
+        week = get_week_base()
+        if is_event_sent("collection_reminder", week):
+            logging.info("collection_reminder: already sent this week, skipping")
+            return
         text = (
             "⏰ <b>Остался 1 час!</b>\n\n"
             "В <b>22:00</b> приём треков закрывается и начинается голосование 🗳\n"
             "Успей отправить свой трек — напиши боту в личку (@track0_day_bot), кнопка «🎵 Отправить трек»."
         )
         await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+        mark_event_sent("collection_reminder", week)
         logging.info("collection closing reminder sent to group")
     except Exception as e:
         logging.error("send_collection_closing_reminder error: %r", e)
@@ -1897,12 +1950,17 @@ async def send_collection_closing_reminder():
 async def send_voting_closing_reminder():
     """Четверг 11:00 — через час закроется голосование."""
     try:
+        week = get_week_base()
+        if is_event_sent("voting_reminder", week):
+            logging.info("voting_reminder: already sent this week, skipping")
+            return
         text = (
             "⏰ <b>Остался 1 час!</b>\n\n"
             "В <b>12:00</b> голосование заканчивается 🗳\n"
             "Успей проголосовать, если ещё не успел!"
         )
         await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+        mark_event_sent("voting_reminder", week)
         logging.info("voting closing reminder sent to group")
     except Exception as e:
         logging.error("send_voting_closing_reminder error: %r", e)
@@ -1923,6 +1981,10 @@ async def bot_can_manage_pins(chat_id):
     return True
 
 async def start_voting():
+    week = get_week_base()
+    if is_event_sent("start_voting", week):
+        logging.info("start_voting: already sent this week, skipping")
+        return False, "already_voting"
     session = get_current_session()
     if not session:
         return False, "no_session"
@@ -2073,6 +2135,7 @@ async def start_voting():
         reply_markup=InlineKeyboardMarkup(inline_keyboard=main_buttons),
         parse_mode="HTML"
     )
+    mark_event_sent("start_voting", week)
     can_manage_pins = await bot_can_manage_pins(GROUP_ID)
     if not can_manage_pins:
         delete_group_pin(GROUP_ID, pin_type="voting_main")
@@ -2122,6 +2185,10 @@ async def unpin_voting_message():
 
 
 async def finish_voting():
+    week = get_week_base()
+    if is_event_sent("finish_voting", week):
+        logging.info("finish_voting: already sent this week, skipping")
+        return
     session = get_current_session()
     if not session:
         return
@@ -2204,12 +2271,56 @@ async def finish_voting():
 
     text += f"\n📋 <a href='{sheet_url}'>Полная таблица лидеров</a>"
     sent_results = await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+    mark_event_sent("finish_voting", week)
     if await bot_can_manage_pins(GROUP_ID):
         try:
             await bot.pin_chat_message(chat_id=GROUP_ID, message_id=sent_results.message_id, disable_notification=False)
             set_group_pin(GROUP_ID, sent_results.message_id, "results_main", session_id)
         except Exception as e:
             logging.warning("Failed to pin results message: %r", e)
+
+async def event_watchdog():
+    """Каждые 10 минут проверяет, были ли отправлены плановые события.
+    Если событие должно было быть отправлено, но не было (например, не было интернета) —
+    отправляет его. Флаг sent_events предотвращает двойную отправку."""
+    try:
+        tz = ZoneInfo(settings.timezone)
+        now = datetime.now(tz)
+        dow = now.weekday()  # 0=Пн, 2=Ср, 3=Чт
+        hour = now.hour
+        week = get_week_base()
+
+        # (день_недели, час_срабатывания, час_отсечки, ключ_события, функция)
+        # час_отсечки: после этого часа напоминание уже не актуально
+        # 25 = без отсечки (важные события отправляем в любое время)
+        watchdog_schedule = [
+            (2, 10, 25, "start_collection",     start_collection),
+            (2, 21, 23, "collection_reminder",  send_collection_closing_reminder),
+            (2, 22, 25, "start_voting",         start_voting),
+            (3, 11, 13, "voting_reminder",      send_voting_closing_reminder),
+            (3, 12, 25, "finish_voting",        finish_voting),
+        ]
+
+        for day, sched_hour, cutoff_hour, event_name, fn in watchdog_schedule:
+            if dow != day:
+                continue
+            if hour < sched_hour:
+                continue
+            if hour >= cutoff_hour:
+                # Напоминание уже не актуально (голосование уже открылось и т.п.)
+                continue
+            if is_event_sent(event_name, week):
+                continue
+            logging.info(
+                f"event_watchdog: событие '{event_name}' не было отправлено "
+                f"(сейчас {now.strftime('%H:%M')}, ожидалось в {sched_hour}:00) — повтор"
+            )
+            try:
+                await fn()
+            except Exception as e:
+                logging.error(f"event_watchdog: ошибка при повторе '{event_name}': {e}")
+    except Exception as e:
+        logging.error(f"event_watchdog error: {e}")
 
 # ==================== ХЭНДЛЕРЫ ====================
 
@@ -2288,6 +2399,7 @@ async def cmd_themes(message: Message):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить тему", callback_data="themes_add")],
         [InlineKeyboardButton(text="📋 Просмотреть все темы", callback_data="themes_list_0")],
+        [InlineKeyboardButton(text="🔒/🟢 Вкл/Выкл тему", callback_data="themes_toggle_menu")],
         [InlineKeyboardButton(text="🗑 Удалить тему", callback_data="themes_delete_menu")],
         [InlineKeyboardButton(text="🔄 Сбросить флаги использования", callback_data="themes_reset")],
     ])
@@ -2357,6 +2469,42 @@ async def themes_list(callback: CallbackQuery):
     await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     await callback.answer()
 
+@dp.callback_query(F.data == "themes_toggle_menu")
+async def themes_toggle_menu(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(ThemeStates.waiting_toggle_theme_id)
+    await callback.message.answer(
+        "🔒/🟢 Напиши <b>номер темы</b> которую хочешь включить или выключить.\n"
+        "Номер можно найти в списке тем (кнопка «Просмотреть все темы»).",
+        parse_mode="HTML",
+        reply_markup=build_cancel_keyboard(),
+    )
+    await callback.answer()
+
+@dp.message(ThemeStates.waiting_toggle_theme_id)
+async def themes_toggle_handler(message: Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    await state.clear()
+    text = message.text.strip() if message.text else ""
+    try:
+        num = int(text)
+    except ValueError:
+        await message.answer("❌ Неверный формат. Введи номер темы цифрой.")
+        return
+    result = get_theme_db_id_by_seq(num)
+    if not result:
+        await message.answer(f"❌ Тема №{num} не найдена. Проверь список тем.")
+        return
+    theme_id, theme_text = result
+    new_used = toggle_theme_used(theme_id)
+    if new_used == 0:
+        status = "🟢 включена (доступна для выбора)"
+    else:
+        status = "🔒 выключена (уже использована)"
+    await message.answer(f"✅ Тема «{theme_text}» теперь {status}.")
+
 @dp.callback_query(F.data == "themes_delete_menu")
 async def themes_delete_menu(callback: CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
@@ -2390,6 +2538,7 @@ async def themes_back(callback: CallbackQuery):
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить тему", callback_data="themes_add")],
         [InlineKeyboardButton(text="📋 Просмотреть все темы", callback_data="themes_list_0")],
+        [InlineKeyboardButton(text="🔒/🟢 Вкл/Выкл тему", callback_data="themes_toggle_menu")],
         [InlineKeyboardButton(text="🗑 Удалить тему", callback_data="themes_delete_menu")],
         [InlineKeyboardButton(text="🔄 Сбросить флаги использования", callback_data="themes_reset")],
     ])
@@ -3693,14 +3842,12 @@ async def main():
     cleanup_expired_runtime_data()
     register_all_handlers(dp)
     scheduler.add_job(start_collection, CronTrigger(day_of_week="wed", hour=10, minute=0), misfire_grace_time=3600)
-    scheduler.add_job(start_collection, CronTrigger(day_of_week="wed", hour=10, minute=10), misfire_grace_time=3600)  # retry
     scheduler.add_job(send_collection_closing_reminder, CronTrigger(day_of_week="wed", hour=21, minute=0), misfire_grace_time=3600)
     scheduler.add_job(start_voting, CronTrigger(day_of_week="wed", hour=22, minute=0), misfire_grace_time=3600)
-    scheduler.add_job(start_voting, CronTrigger(day_of_week="wed", hour=22, minute=10), misfire_grace_time=3600)  # retry
     scheduler.add_job(send_voting_closing_reminder, CronTrigger(day_of_week="thu", hour=11, minute=0), misfire_grace_time=3600)
     scheduler.add_job(finish_voting, CronTrigger(day_of_week="thu", hour=12, minute=0), misfire_grace_time=3600)
-    scheduler.add_job(finish_voting, CronTrigger(day_of_week="thu", hour=12, minute=10), misfire_grace_time=3600)  # retry
     scheduler.add_job(unpin_voting_message, CronTrigger(day_of_week="thu", hour=14, minute=0), misfire_grace_time=3600)
+    scheduler.add_job(event_watchdog, IntervalTrigger(minutes=10))  # повтор при отсутствии интернета
     scheduler.add_job(cleanup_runtime_data_job, IntervalTrigger(hours=1))
     scheduler.start()
     print("🎵 Track Day Bot запущен!")

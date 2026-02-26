@@ -5,6 +5,7 @@ class ThemeStates(StatesGroup):
     waiting_theme_admin = State()
     waiting_theme_user = State()
     waiting_delete_theme_id = State()
+    waiting_toggle_theme_id = State()
 
 
 class NominationStates(StatesGroup):
