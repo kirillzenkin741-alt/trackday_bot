@@ -2024,10 +2024,10 @@ async def start_voting():
     text = (
         f"🗳 <b>ГОЛОСОВАНИЕ НАЧАЛОСЬ!</b>\n\n"
         f"Тема: <b>{session[2]}</b>\n\n"
-        "Сначала выбери победителей во всех номинациях (если они есть), затем проголосуй за лучший трек недели.\n\n"
+        "Выбери победителей в каждой номинации — нажимай на кнопки под треками!\n\n"
         "⏰ Голосование закроется завтра в 12:00"
     )
-    await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+    sent_announce = await bot.send_message(GROUP_ID, text, parse_mode="HTML")
 
     # Отправляем каждый трек отдельным сообщением с кнопками площадок
     track_seq = {}
@@ -2116,25 +2116,6 @@ async def start_voting():
             parse_mode="HTML"
         )
 
-    # Финальный этап: лучший трек недели
-    main_buttons = []
-    for track in tracks:
-        t_title = track[9] if len(track) > 9 and track[9] else ""
-        t_artist = track[10] if len(track) > 10 and track[10] else ""
-        label = format_track_label(t_artist, t_title, fallback=f"Трек #{track_seq[track[0]]}")
-        main_buttons.append([
-            InlineKeyboardButton(
-                text=f"✅ {short_button_text(label)}",
-                callback_data=f"mainvote_{session_id}_{track[0]}"
-            )
-        ])
-    main_text = "🏆 <b>Финал: Лучший трек недели</b>\n\nВыбери победителя после голосования по номинациям."
-    sent_main = await bot.send_message(
-        GROUP_ID,
-        main_text,
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=main_buttons),
-        parse_mode="HTML"
-    )
     mark_event_sent("start_voting", week)
     can_manage_pins = await bot_can_manage_pins(GROUP_ID)
     if not can_manage_pins:
@@ -2160,10 +2141,10 @@ async def start_voting():
         finally:
             delete_group_pin(GROUP_ID, pin_type="voting_main")
     try:
-        await bot.pin_chat_message(chat_id=GROUP_ID, message_id=sent_main.message_id, disable_notification=False)
-        set_group_pin(GROUP_ID, sent_main.message_id, "voting_main", session_id)
+        await bot.pin_chat_message(chat_id=GROUP_ID, message_id=sent_announce.message_id, disable_notification=False)
+        set_group_pin(GROUP_ID, sent_announce.message_id, "voting_main", session_id)
     except Exception as e:
-        logging.warning("Failed to pin voting message: chat_id=%s message_id=%s err=%r", GROUP_ID, sent_main.message_id, e)
+        logging.warning("Failed to pin voting message: chat_id=%s message_id=%s err=%r", GROUP_ID, sent_announce.message_id, e)
     return True, "started"
 
 async def unpin_voting_message():
@@ -2204,40 +2185,16 @@ async def finish_voting():
         return
     else:
         update_session_state(session_id, 'finished')
-    results = get_vote_results(session_id)
-    if not results:
-        return
+    tracks = get_session_tracks(session_id)
     sheet_url = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}"
-
-    # Результаты голосования
-    text = f"🏆 <b>РЕЗУЛЬТАТЫ TRACK DAY!</b>\n\nТема: <b>{session[2]}</b>\n\n"
     medals = ["🥇", "🥈", "🥉"]
-    winner = results[0]
-    for i, result in enumerate(results):
-        track_id, full_name, username, url, desc, votes = result
-        medal = medals[i] if i < 3 else f"{i+1}."
-        text += f"{medal} <a href='{url}'>{full_name}</a> — {votes} голос(ов)\n"
 
-    save_main_winner(session_id, winner[0], winner[5])
-    if winner[5] > 0:
-        winner_user_id = get_track_user_id(winner[0])
-        if winner_user_id:
-            apply_points_event(
-                winner_user_id,
-                winner[2],
-                winner[1],
-                3,
-                event_key=f"main_win:{session_id}:{winner_user_id}",
-                event_type="main_win",
-                session_id=session_id,
-                is_win=True,
-            )
-        text += f"\n🎉 Победитель: <b>{winner[1]}</b> (+3 очка!)\n"
+    text = f"🏆 <b>РЕЗУЛЬТАТЫ TRACK DAY!</b>\n\nТема: <b>{session[2]}</b>\n\n"
 
     # Победители номинаций
     nomination_winners = get_nomination_winners(session_id)
     if nomination_winners:
-        text += "\n🏅 <b>Победители номинаций:</b>\n"
+        text += "🏅 <b>Победители номинаций:</b>\n"
     for nomination_id, nom_name, track_id, full_name, username, track_url, votes in nomination_winners:
         if votes <= 0:
             text += f"• {nom_name}: никто не проголосовал\n"
@@ -2260,13 +2217,23 @@ async def finish_voting():
 
     # Итоговая таблица очков
     board = get_leaderboard()
-    text += f"\n\n📊 <b>ТЕКУЩИЙ РЕЙТИНГ:</b>\n"
+    text += f"\n📊 <b>ТЕКУЩИЙ РЕЙТИНГ:</b>\n"
     for i, (full_name, points, wins, participations) in enumerate(board):
         medal = medals[i] if i < 3 else f"{i+1}."
         text += f"{medal} <b>{full_name}</b> — {points} очков\n"
 
-    tracks = get_session_tracks(session_id)
-    add_week_to_history(session[1], session[2], winner[1], winner[3], winner[5], len(tracks))
+    # Раскрытие анонимности: кто что скидывал
+    if tracks:
+        text += "\n🎵 <b>Кто что скидывал:</b>\n"
+        for track in tracks:
+            t_url = track[5]
+            t_title = track[9] or ""
+            t_artist = track[10] or ""
+            t_author = track[4]
+            track_label = format_track_label(t_artist, t_title, fallback="Трек")
+            text += f"• <a href='{t_url}'>{track_label}</a> — {t_author}\n"
+
+    add_week_to_history(session[1], session[2], "—", "—", 0, len(tracks))
     update_leaderboard_sheet()
 
     text += f"\n📋 <a href='{sheet_url}'>Полная таблица лидеров</a>"
