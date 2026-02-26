@@ -9,6 +9,7 @@ class ThemeStates(StatesGroup):
 
 class NominationStates(StatesGroup):
     waiting_nomination_name = State()
+    waiting_nomination_points = State()
     waiting_nomination_delete_id = State()
 
 

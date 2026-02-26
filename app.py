@@ -865,6 +865,11 @@ def init_db():
     c.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_nom_votes_session_nom_voter ON nomination_votes(session_id, nomination_id, voter_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_submit_candidates_user_session ON submit_candidates(user_id, session_id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_api_cache_expires ON api_cache(expires_at)")
+    # Миграция: добавляем колонку points к nominations (если ещё не существует)
+    try:
+        c.execute("ALTER TABLE nominations ADD COLUMN points INTEGER NOT NULL DEFAULT 1")
+    except sqlite3.OperationalError:
+        pass
     conn.commit()
     conn.close()
 
@@ -1288,12 +1293,12 @@ def add_vote(session_id, voter_id, track_id):
     finally:
         conn.close()
 
-def add_nomination(name):
+def add_nomination(name, points=1):
     conn = sqlite3.connect("trackday.db")
     c = conn.cursor()
     now = datetime.now().isoformat()
     try:
-        c.execute("INSERT INTO nominations (name, is_active, created_at) VALUES (?, 1, ?)", (name, now))
+        c.execute("INSERT INTO nominations (name, is_active, points, created_at) VALUES (?, 1, ?, ?)", (name, points, now))
         conn.commit()
         return True
     except sqlite3.IntegrityError:
@@ -1305,17 +1310,25 @@ def get_nominations(active_only=False):
     conn = sqlite3.connect("trackday.db")
     c = conn.cursor()
     if active_only:
-        c.execute("SELECT id, name, is_active FROM nominations WHERE is_active = 1 ORDER BY id")
+        c.execute("SELECT id, name, is_active, points FROM nominations WHERE is_active = 1 ORDER BY id")
     else:
-        c.execute("SELECT id, name, is_active FROM nominations ORDER BY id")
+        c.execute("SELECT id, name, is_active, points FROM nominations ORDER BY id")
     rows = c.fetchall()
     conn.close()
     return rows
 
+def get_nomination_points(nomination_id):
+    conn = sqlite3.connect("trackday.db")
+    c = conn.cursor()
+    c.execute("SELECT points FROM nominations WHERE id = ?", (nomination_id,))
+    row = c.fetchone()
+    conn.close()
+    return row[0] if row else 1
+
 def get_nomination_db_id_by_seq(seq_num):
     nominations = get_nominations(active_only=False)
     if 1 <= seq_num <= len(nominations):
-        nomination_id, name, is_active = nominations[seq_num - 1]
+        nomination_id, name, is_active, _ = nominations[seq_num - 1]
         return nomination_id, name
     return None
 
@@ -2163,18 +2176,20 @@ async def finish_voting():
             text += f"• {nom_name}: никто не проголосовал\n"
             continue
         save_nomination_winner(session_id, nomination_id, nom_name, track_id, votes)
+        nom_points = get_nomination_points(nomination_id)
         winner_user_id = get_track_user_id(track_id)
-        if winner_user_id:
+        if winner_user_id and nom_points != 0:
             apply_points_event(
                 winner_user_id,
                 username,
                 full_name,
-                1,
+                nom_points,
                 event_key=f"nom_win:{session_id}:{nomination_id}:{winner_user_id}",
                 event_type="nomination_win",
                 session_id=session_id,
             )
-        text += f"• {nom_name}: <a href='{track_url}'>{full_name}</a> — {votes} голос(ов) (+1 очко)\n"
+        pts = f"+{nom_points}" if nom_points >= 0 else str(nom_points)
+        text += f"• {nom_name}: <a href='{track_url}'>{full_name}</a> — {votes} голос(ов) ({pts} очко)\n"
 
     # Итоговая таблица очков
     board = get_leaderboard()
@@ -2324,8 +2339,10 @@ async def themes_list(callback: CallbackQuery):
 
     text = f"📋 <b>Темы (страница {page+1}/{max(1,total_pages)}):</b>\n\n"
     for i, (theme_id, theme_text, used) in enumerate(page_themes, start + 1):
-        status = "✅" if not used else "☑️"
-        text += f"{status} <b>{i}.</b> {theme_text}\n\n"
+        if not used:
+            text += f"🟢 <b>{i}.</b> {theme_text}\n\n"
+        else:
+            text += f"🔒 <b>{i}.</b> <s>{theme_text}</s>\n\n"
 
     buttons = []
     nav = []
@@ -2394,7 +2411,7 @@ async def cmd_nominations(message: Message):
         await message.answer("🔒 Управление номинациями только в личке!")
         return
     nominations = get_nominations(active_only=False)
-    active_count = sum(1 for _, _, is_active in nominations if is_active)
+    active_count = sum(1 for _, _, is_active, _ in nominations if is_active)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить номинацию", callback_data="nom_add")],
         [InlineKeyboardButton(text="📋 Список номинаций", callback_data="nom_list_0")],
@@ -2445,9 +2462,10 @@ def render_nominations_page(page):
         )
     text = f"🏅 <b>Номинации (страница {page + 1}/{max(1, total_pages)}):</b>\n\n"
     buttons = []
-    for idx, (nomination_id, name, is_active) in enumerate(page_rows, start + 1):
+    for idx, (nomination_id, name, is_active, points) in enumerate(page_rows, start + 1):
         status = "✅" if is_active else "⛔"
-        text += f"{status} <b>{idx}.</b> {name}\n"
+        pts = f"+{points}" if points >= 0 else str(points)
+        text += f"{status} <b>{idx}.</b> {name} ({pts} очков)\n"
         toggle_label = "⛔ Выключить" if is_active else "✅ Включить"
         buttons.append([InlineKeyboardButton(text=f"{toggle_label}: {idx}", callback_data=f"nom_toggle_{nomination_id}_{page}")])
     nav = []
@@ -2493,7 +2511,7 @@ async def nominations_back(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     nominations = get_nominations(active_only=False)
-    active_count = sum(1 for _, _, is_active in nominations if is_active)
+    active_count = sum(1 for _, _, is_active, _ in nominations if is_active)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить номинацию", callback_data="nom_add")],
         [InlineKeyboardButton(text="📋 Список номинаций", callback_data="nom_list_0")],
@@ -2688,7 +2706,7 @@ async def cb_admin_nominations(callback: CallbackQuery):
         return
     await callback.answer()
     nominations = get_nominations(active_only=False)
-    active_count = sum(1 for _, _, is_active in nominations if is_active)
+    active_count = sum(1 for _, _, is_active, _ in nominations if is_active)
     keyboard = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="➕ Добавить номинацию", callback_data="nom_add")],
         [InlineKeyboardButton(text="📋 Список номинаций", callback_data="nom_list_0")],
@@ -2740,7 +2758,21 @@ async def cb_admin_startcollection(callback: CallbackQuery):
                 f"• Треки будут анонимными до результатов\n\n"
                 f"🏆 <a href='{sheet_url}'>Таблица лидеров</a> | За участие: +1 очко"
             )
-            await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+            sent = await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+            if await bot_can_manage_pins(GROUP_ID):
+                stale = get_group_pin(GROUP_ID, pin_type="collection_main")
+                if stale:
+                    try:
+                        await bot.unpin_chat_message(chat_id=GROUP_ID, message_id=stale["message_id"])
+                    except Exception:
+                        pass
+                    finally:
+                        delete_group_pin(GROUP_ID, pin_type="collection_main")
+                try:
+                    await bot.pin_chat_message(chat_id=GROUP_ID, message_id=sent.message_id, disable_notification=False)
+                    set_group_pin(GROUP_ID, sent.message_id, "collection_main", session_id)
+                except Exception as e:
+                    logging.warning("Failed to pin collection message from admin panel: %r", e)
             await callback.message.answer(f"✅ Сбор треков запущен!\nНеделя: {session[1]}\nТема: {session[2]}")
         else:
             await callback.message.answer("❌ Ошибка — сессия не создалась. Проверь лог.")
@@ -2806,6 +2838,19 @@ async def cb_admin_updatesheets(callback: CallbackQuery):
         logging.error(f"cb_admin_updatesheets error: {e}")
 
 
+@dp.message(F.chat.type == "private", F.photo)
+async def handle_private_photo(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state == SubmitStates.waiting_track_input.state:
+        await message.answer("❌ Отправка фото не поддерживается. Пришли ссылку или название трека (например: «Исполнитель — Название»).")
+        return
+    is_admin = message.from_user.id == ADMIN_ID
+    await message.answer(
+        "Выбери действие из меню 👇",
+        reply_markup=build_main_menu_keyboard(is_admin=is_admin),
+    )
+
+
 @dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
 async def handle_private_message(message: Message, state: FSMContext):
     user_id = message.from_user.id
@@ -2858,12 +2903,37 @@ async def handle_private_message(message: Message, state: FSMContext):
         if len(message_text) < 3:
             await message.answer("❌ Название слишком короткое (минимум 3 символа).")
             return
-        if add_nomination(message_text):
+        await state.update_data(nomination_name=message_text)
+        await state.set_state(NominationStates.waiting_nomination_points)
+        await message.answer(
+            f"✅ Название: <b>{message_text}</b>\n\n"
+            "Теперь укажи <b>количество очков</b> за победу в этой номинации.\n"
+            "Можно отрицательное: <b>1</b>, <b>2</b>, <b>-1</b>",
+            parse_mode="HTML",
+            reply_markup=build_cancel_keyboard(),
+        )
+        return
+
+    if current_state == NominationStates.waiting_nomination_points.state and user_id == ADMIN_ID:
+        try:
+            points = int(message_text)
+        except ValueError:
+            await message.answer("❌ Введи целое число (например: 1, 2, -1).")
+            return
+        data = await state.get_data()
+        nom_name = data.get("nomination_name", "")
+        if not nom_name:
+            await message.answer("❌ Ошибка: название потеряно. Начни заново.")
+            await state.clear()
+            return
+        if add_nomination(nom_name, points):
+            pts = f"+{points}" if points >= 0 else str(points)
             await message.answer(
-                f"✅ Номинация добавлена: <b>{message_text}</b>\n\n"
-                "Добавь следующую или нажми «❌ Отмена».",
-                parse_mode="HTML"
+                f"✅ Номинация добавлена: <b>{nom_name}</b> ({pts} очков)\n\n"
+                "Добавь следующую (напиши название) или нажми «❌ Отмена».",
+                parse_mode="HTML",
             )
+            await state.set_state(NominationStates.waiting_nomination_name)
         else:
             await message.answer("❌ Такая номинация уже есть.")
         return
@@ -3207,7 +3277,7 @@ async def cb_mytrack_replace(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(SubmitStates.waiting_track_input)
     await state.update_data(session_id=session_id, pending_token=None, source_type=None)
-    await callback.message.answer("🔁 Пришли новую ссылку, текст или скриншот. Сначала покажу варианты, потом подтверждение.")
+    await callback.message.answer("🔁 Пришли новую ссылку или название трека. Сначала покажу варианты, потом подтверждение.")
     await callback.answer("Режим замены включен")
 
 
@@ -3268,7 +3338,7 @@ async def handle_replace_track(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SubmitStates.waiting_track_input)
     await state.update_data(session_id=session_id, pending_token=None, source_type=None)
     await callback.message.answer(
-        "🔁 Режим замены включен.\n\nПришли новую ссылку, текст или скриншот."
+        "🔁 Режим замены включен.\n\nПришли новую ссылку или название трека."
     )
     await callback.answer("Ожидаю новый трек")
 
@@ -3333,6 +3403,26 @@ async def handle_nomination_vote(callback: CallbackQuery):
         await callback.answer("🔁 Голос в номинации обновлён")
     else:
         await callback.answer("❌ Не удалось сохранить голос", show_alert=True)
+        return
+    if callback.message.reply_markup:
+        new_rows = []
+        for row in callback.message.reply_markup.inline_keyboard:
+            new_row = []
+            for btn in row:
+                if btn.callback_data and btn.callback_data.startswith("nomvote_"):
+                    btn_parts = btn.callback_data.split("_")
+                    if len(btn_parts) == 4 and int(btn_parts[2]) == nomination_id:
+                        clean = btn.text.replace("✅ ", "", 1)
+                        new_row.append(InlineKeyboardButton(text=f"✅ {clean}", callback_data=btn.callback_data))
+                    else:
+                        new_row.append(btn)
+                else:
+                    new_row.append(btn)
+            new_rows.append(new_row)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=new_rows))
+        except Exception:
+            pass
 
 @dp.callback_query(F.data.startswith("mainvote_"))
 async def handle_main_vote(callback: CallbackQuery):
@@ -3374,6 +3464,26 @@ async def handle_main_vote(callback: CallbackQuery):
         await callback.answer("🔁 Голос обновлён", show_alert=True)
     else:
         await callback.answer("❌ Не удалось сохранить голос", show_alert=True)
+        return
+    if callback.message.reply_markup:
+        new_rows = []
+        for row in callback.message.reply_markup.inline_keyboard:
+            new_row = []
+            for btn in row:
+                if btn.callback_data and btn.callback_data.startswith("mainvote_"):
+                    btn_parts = btn.callback_data.split("_")
+                    clean = btn.text.replace("✅ ", "", 1)
+                    if len(btn_parts) == 3 and int(btn_parts[2]) == track_id:
+                        new_row.append(InlineKeyboardButton(text=f"✅ {clean}", callback_data=btn.callback_data))
+                    else:
+                        new_row.append(InlineKeyboardButton(text=clean, callback_data=btn.callback_data))
+                else:
+                    new_row.append(btn)
+            new_rows.append(new_row)
+        try:
+            await callback.message.edit_reply_markup(reply_markup=InlineKeyboardMarkup(inline_keyboard=new_rows))
+        except Exception:
+            pass
 
 @dp.callback_query(F.data.startswith("vote_"))
 async def handle_legacy_vote(callback: CallbackQuery):
@@ -3508,7 +3618,21 @@ async def cmd_force_start(message: Message):
                 f"• Треки будут анонимными до результатов\n\n"
                 f"🏆 <a href='{sheet_url}'>Таблица лидеров</a> | За участие: +1 очко"
             )
-            await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+            sent = await bot.send_message(GROUP_ID, text, parse_mode="HTML")
+            if await bot_can_manage_pins(GROUP_ID):
+                stale = get_group_pin(GROUP_ID, pin_type="collection_main")
+                if stale:
+                    try:
+                        await bot.unpin_chat_message(chat_id=GROUP_ID, message_id=stale["message_id"])
+                    except Exception:
+                        pass
+                    finally:
+                        delete_group_pin(GROUP_ID, pin_type="collection_main")
+                try:
+                    await bot.pin_chat_message(chat_id=GROUP_ID, message_id=sent.message_id, disable_notification=False)
+                    set_group_pin(GROUP_ID, sent.message_id, "collection_main", session_id)
+                except Exception as e:
+                    logging.warning("Failed to pin collection message from admin command: %r", e)
             await message.answer(f"✅ Сбор треков запущен!\nНеделя: {session[1]}\nТема: {session[2]}")
         else:
             await message.answer("❌ Ошибка — сессия не создалась. Проверь лог.")
@@ -3570,7 +3694,6 @@ async def main():
     register_all_handlers(dp)
     scheduler.add_job(start_collection, CronTrigger(day_of_week="wed", hour=10, minute=0), misfire_grace_time=3600)
     scheduler.add_job(start_collection, CronTrigger(day_of_week="wed", hour=10, minute=10), misfire_grace_time=3600)  # retry
-    scheduler.add_job(send_wednesday_reminder, CronTrigger(day_of_week="wed", hour=10, minute=0), misfire_grace_time=3600)
     scheduler.add_job(send_collection_closing_reminder, CronTrigger(day_of_week="wed", hour=21, minute=0), misfire_grace_time=3600)
     scheduler.add_job(start_voting, CronTrigger(day_of_week="wed", hour=22, minute=0), misfire_grace_time=3600)
     scheduler.add_job(start_voting, CronTrigger(day_of_week="wed", hour=22, minute=10), misfire_grace_time=3600)  # retry
