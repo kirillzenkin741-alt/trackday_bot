@@ -14,7 +14,6 @@ import gspread
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from urllib.parse import urlsplit, urlunsplit
-from google.oauth2.service_account import Credentials
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton, ChatMemberUpdated
 from aiogram.filters import Command
@@ -443,6 +442,15 @@ def _normalized_variant_key(text: str):
     return re.sub(r"[\W_]+", " ", normalize_query_text(text)).strip()
 
 
+def _swap_artist_separator(text: str) -> str:
+    """Заменяет ' & ' на ', ' и наоборот — для поиска треков на разных площадках."""
+    if " & " in text:
+        return text.replace(" & ", ", ")
+    if re.search(r",\s*", text):
+        return re.sub(r",\s+", " & ", text)
+    return text
+
+
 def generate_translit_variants(query: str):
     variants = []
     seen = set()
@@ -454,26 +462,37 @@ def generate_translit_variants(query: str):
         seen.add(nv)
         variants.append(v.strip())
 
-    add_variant(query)
+    def add_with_sep(v: str):
+        """Добавляет вариант и его версию с альтернативным разделителем артистов."""
+        add_variant(v)
+        alt = _swap_artist_separator(v)
+        if alt != v:
+            add_variant(alt)
+
+    add_with_sep(query)
     try:
         if _contains_cyrillic(query):
-            add_variant(_transliterate_mixed(query, "ru_to_lat"))
+            translit_q = _transliterate_mixed(query, "ru_to_lat")
+            add_with_sep(translit_q)
     except Exception:
         pass
     try:
         if _contains_latin(query):
-            add_variant(_transliterate_mixed(query, "lat_to_ru"))
+            translit_q = _transliterate_mixed(query, "lat_to_ru")
+            add_with_sep(translit_q)
     except Exception:
         pass
     if translit:
         try:
             if _contains_cyrillic(query):
-                add_variant(translit(query, "ru", reversed=True))
+                tq = translit(query, "ru", reversed=True)
+                add_with_sep(tq)
         except Exception:
             pass
         try:
             if _contains_latin(query):
-                add_variant(translit(query, "ru"))
+                tq = translit(query, "ru")
+                add_with_sep(tq)
         except Exception:
             pass
     return variants
@@ -626,23 +645,12 @@ async def search_track_url_by_text(query: str):
 
 # ==================== GOOGLE SHEETS ====================
 def get_sheets_client():
-    try:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive"
-        ]
-        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scopes)
-        client = gspread.authorize(creds)
-        return client
-    except Exception as e:
-        logging.error(f"Google Sheets error: {e}")
-        return None
+    # gspread.authorize() удалён в gspread 6.x — используем service_account()
+    return gspread.service_account(filename=CREDENTIALS_FILE)
 
 def update_leaderboard_sheet():
     try:
         client = get_sheets_client()
-        if not client:
-            return
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
         try:
             sheet = spreadsheet.worksheet("🏆 Лидерборд")
@@ -672,8 +680,6 @@ def update_leaderboard_sheet():
 def add_week_to_history(week, theme, winner_name, track_url, votes, participants):
     try:
         client = get_sheets_client()
-        if not client:
-            return
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
         try:
             history_sheet = spreadsheet.worksheet("📅 История")
@@ -689,8 +695,6 @@ def sync_history_to_sheets():
     Возвращает (added_count, error_str_or_None)."""
     try:
         client = get_sheets_client()
-        if not client:
-            return 0, "нет подключения к Google Sheets (проверь credentials.json)"
         spreadsheet = client.open_by_key(SPREADSHEET_ID)
         try:
             history_sheet = spreadsheet.worksheet("📅 История")
@@ -1294,8 +1298,30 @@ def get_session_tracks(session_id):
     conn.close()
     return tracks
 
-async def save_or_update_track_submission(session_id, user_id, username, full_name, track_url, description):
+async def save_or_update_track_submission(
+    session_id, user_id, username, full_name, track_url, description,
+    track_title="", track_artist="",
+):
+    is_mp3 = track_url.startswith("tg_audio:")
     existing = get_user_track_in_session(user_id, session_id)
+
+    if is_mp3:
+        track_label = format_track_label(track_artist, track_title, fallback="MP3 файл")
+        conn2 = sqlite3.connect("trackday.db")
+        c2 = conn2.cursor()
+        if existing:
+            c2.execute(
+                "UPDATE tracks SET track_url=?, track_description=?, song_links=?, track_title=?, track_artist=?, track_thumbnail=? WHERE id=?",
+                (track_url, description, "", track_title, track_artist, "", existing[0]),
+            )
+            conn2.commit()
+            conn2.close()
+            return "updated", "MP3 файл", track_label, track_url
+        conn2.close()
+        add_track(session_id, user_id, username, full_name, track_url, description,
+                  song_links_json="", track_title=track_title, track_artist=track_artist, track_thumbnail="")
+        return "new", "MP3 файл", track_label, track_url
+
     if existing:
         song_data = await get_song_links(track_url)
         song_links = song_data.get("links", {})
@@ -2126,20 +2152,44 @@ async def start_voting():
             if platform_row:
                 buttons.append(platform_row)
         else:
-            # Если ссылки не найдены — просто кнопка на оригинал
-            buttons.append([InlineKeyboardButton(text="🔗 Слушать", url=track[5])])
+            # Если ссылки не найдены — просто кнопка на оригинал (не для MP3)
+            if not track[5].startswith("tg_audio:"):
+                buttons.append([InlineKeyboardButton(text="🔗 Слушать", url=track[5])])
 
-        keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
-        if thumbnail:
+        is_mp3_track = track[5].startswith("tg_audio:")
+        if is_mp3_track:
+            file_id = track[5][len("tg_audio:"):]
             try:
-                await bot.send_photo(
+                await bot.send_audio(
                     GROUP_ID,
-                    photo=thumbnail,
+                    audio=file_id,
                     caption=track_text,
-                    reply_markup=keyboard,
                     parse_mode="HTML",
+                    performer=artist or None,
+                    title=title or None,
                 )
             except Exception:
+                await bot.send_message(GROUP_ID, track_text, parse_mode="HTML")
+        else:
+            keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+            if thumbnail:
+                try:
+                    await bot.send_photo(
+                        GROUP_ID,
+                        photo=thumbnail,
+                        caption=track_text,
+                        reply_markup=keyboard,
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    fallback_text = f"{track_text}\n🔗 {track[5]}"
+                    await bot.send_message(
+                        GROUP_ID,
+                        fallback_text,
+                        reply_markup=keyboard,
+                        parse_mode="HTML",
+                    )
+            else:
                 fallback_text = f"{track_text}\n🔗 {track[5]}"
                 await bot.send_message(
                     GROUP_ID,
@@ -2147,14 +2197,6 @@ async def start_voting():
                     reply_markup=keyboard,
                     parse_mode="HTML",
                 )
-        else:
-            fallback_text = f"{track_text}\n🔗 {track[5]}"
-            await bot.send_message(
-                GROUP_ID,
-                fallback_text,
-                reply_markup=keyboard,
-                parse_mode="HTML",
-            )
 
     # Номинации: отдельный блок по каждой номинации
     for nomination_id, nomination_name in session_nominations:
@@ -2274,7 +2316,10 @@ async def finish_voting():
                 session_id=session_id,
             )
         pts = f"+{nom_points}" if nom_points >= 0 else str(nom_points)
-        text += f"• {nom_name}: <a href='{track_url}'>{full_name}</a> — {votes} голос(ов) ({pts} очко)\n"
+        if track_url.startswith("tg_audio:"):
+            text += f"• {nom_name}: {full_name} — {votes} голос(ов) ({pts} очко)\n"
+        else:
+            text += f"• {nom_name}: <a href='{track_url}'>{full_name}</a> — {votes} голос(ов) ({pts} очко)\n"
 
     # Итоговая таблица очков
     board = get_leaderboard()
@@ -2292,7 +2337,10 @@ async def finish_voting():
             t_artist = track[10] or ""
             t_author = track[4]
             track_label = format_track_label(t_artist, t_title, fallback="Трек")
-            text += f"• <a href='{t_url}'>{track_label}</a> — {t_author}\n"
+            if t_url.startswith("tg_audio:"):
+                text += f"• 📎 {track_label} — {t_author}\n"
+            else:
+                text += f"• <a href='{t_url}'>{track_label}</a> — {t_author}\n"
 
     add_week_to_history(session[1], session[2], "—", "—", 0, len(tracks))
     update_leaderboard_sheet()
@@ -2808,13 +2856,24 @@ async def cmd_submit(message: Message, state: FSMContext):
         )
     existing = get_user_track_in_session(message.from_user.id, session[0])
     if existing:
+        ex_url = existing[5] or ""
+        ex_label = format_track_label(
+            existing[10] if len(existing) > 10 else "",
+            existing[9] if len(existing) > 9 else "",
+            fallback=ex_url,
+        )
+        ex_display = "📎 MP3 файл" if ex_url.startswith("tg_audio:") else ex_url
         await message.answer(
-            f"Ты уже скинул трек на этой неделе:\n{existing[5]}\n\nХочешь заменить? Просто пришли новую ссылку."
+            f"Ты уже скинул трек на этой неделе:\n🎵 <b>{ex_label}</b>\n{ex_display}\n\nХочешь заменить? Пришли новую ссылку, название или MP3.",
+            parse_mode="HTML",
         )
     await message.answer(
         f"🎵 Тема недели: <b>{session[2]}</b>\n\n"
-        "Пришли ссылку на трек (Spotify, YouTube, VK Music, Tidal — любая)\n"
-        "Или просто напиши название трека (например: Rick Astley - Never Gonna Give You Up) 👇",
+        "Как отправить трек — выбери способ:\n\n"
+        "🔗 <b>Ссылка</b> — пришли ссылку на трек (Spotify, YouTube, VK Music, Tidal и др.)\n"
+        "📝 <b>Название</b> — напиши «Исполнитель — Название»\n"
+        "📎 <b>MP3</b> — прикрепи аудиофайл прямо сюда\n\n"
+        "Жду твой вариант 👇",
         parse_mode="HTML"
     )
     old_data = await state.get_data()
@@ -3031,12 +3090,90 @@ async def cb_admin_updatesheets(callback: CallbackQuery):
 async def handle_private_photo(message: Message, state: FSMContext):
     current_state = await state.get_state()
     if current_state == SubmitStates.waiting_track_input.state:
-        await message.answer("❌ Отправка фото не поддерживается. Пришли ссылку или название трека (например: «Исполнитель — Название»).")
+        await message.answer("❌ Отправка фото не поддерживается. Пришли ссылку, название трека или MP3 файл.")
         return
     is_admin = message.from_user.id == ADMIN_ID
     await message.answer(
         "Выбери действие из меню 👇",
         reply_markup=build_main_menu_keyboard(is_admin=is_admin),
+    )
+
+
+@dp.message(F.chat.type == "private", F.audio | F.document)
+async def handle_private_audio(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state not in (
+        SubmitStates.waiting_track_input.state,
+        SubmitStates.waiting_candidate_choice.state,
+        SubmitStates.waiting_confirmation.state,
+    ):
+        is_admin = message.from_user.id == ADMIN_ID
+        await message.answer(
+            "Выбери действие из меню 👇",
+            reply_markup=build_main_menu_keyboard(is_admin=is_admin),
+        )
+        return
+
+    if current_state in (SubmitStates.waiting_candidate_choice.state, SubmitStates.waiting_confirmation.state):
+        await message.answer("Выбери вариант кнопками ниже.")
+        return
+
+    # Принимаем audio или document с audio/* MIME
+    audio = message.audio
+    if not audio and message.document:
+        doc = message.document
+        if doc.mime_type and doc.mime_type.startswith("audio/"):
+            audio = doc
+    if not audio:
+        await message.answer("❌ Не распознан аудиофайл. Пришли MP3 файл или ссылку/название трека.")
+        return
+
+    data = await state.get_data()
+    session_id = data.get("session_id")
+    if not session_id:
+        await state.clear()
+        await message.answer("❌ Сессия отправки устарела. Нажми «🎵 Отправить трек» снова.")
+        return
+    session_row = get_current_session()
+    if not session_row or session_row[0] != session_id or session_row[3] != "collecting":
+        await state.clear()
+        await message.answer("❌ Сессия отправки недоступна. Нажми «🎵 Отправить трек» снова.")
+        return
+
+    file_id = audio.file_id
+    title = getattr(audio, "title", "") or ""
+    performer = getattr(audio, "performer", "") or ""
+
+    if not title and not performer:
+        file_name = getattr(audio, "file_name", "") or ""
+        if file_name.lower().endswith(".mp3"):
+            file_name = file_name[:-4]
+        if " - " in file_name:
+            parts = file_name.split(" - ", 1)
+            performer = parts[0].strip()
+            title = parts[1].strip()
+        elif " — " in file_name:
+            parts = file_name.split(" — ", 1)
+            performer = parts[0].strip()
+            title = parts[1].strip()
+        else:
+            title = file_name.strip() or "MP3 файл"
+
+    track_url = f"tg_audio:{file_id}"
+    candidate = {
+        "track_url": track_url,
+        "title": title,
+        "artist": performer,
+        "thumbnail_url": "",
+    }
+    await send_candidates_prompt(
+        message=message,
+        state=state,
+        session_id=session_id,
+        source_type="mp3",
+        query_text=track_url,
+        description="",
+        candidates=[candidate],
     )
 
 
@@ -3281,10 +3418,11 @@ async def handle_candidate_pick(callback: CallbackQuery, state: FSMContext):
     selected = candidates[idx]
     label = format_candidate_label(selected, fallback="Неизвестный трек")
     track_url = selected.get("track_url", "")
+    url_line = "📎 MP3 файл" if track_url.startswith("tg_audio:") else f"🔗 {track_url}"
     await state.set_state(SubmitStates.waiting_confirmation)
     await state.update_data(session_id=pending["session_id"], pending_token=token, source_type=pending["source_type"])
     await callback.message.answer(
-        f"Найдено:\n🎵 <b>{label}</b>\n🔗 {track_url}\n\nПодтверждаешь сохранение?",
+        f"Найдено:\n🎵 <b>{label}</b>\n{url_line}\n\nПодтверждаешь сохранение?",
         parse_mode="HTML",
         reply_markup=build_submit_confirm_keyboard(token),
     )
@@ -3387,12 +3525,16 @@ async def handle_submit_confirm(callback: CallbackQuery, state: FSMContext):
         full_name=callback.from_user.full_name,
         track_url=track_url,
         description=pending["description"],
+        track_title=selected.get("title", ""),
+        track_artist=selected.get("artist", ""),
     )
+    is_mp3 = accepted_url.startswith("tg_audio:")
+    url_line = "📎 MP3 файл" if is_mp3 else f"🔗 {accepted_url}"
     if status == "updated":
         await callback.message.answer(
             f"✅ Трек обновлён!\n"
             f"🎵 <b>{track_label}</b>\n"
-            f"🔗 {accepted_url}\n\n"
+            f"{url_line}\n\n"
             f"{links_info}\n\n"
             f"Ждём голосования в 22:00",
             parse_mode="HTML",
@@ -3402,7 +3544,7 @@ async def handle_submit_confirm(callback: CallbackQuery, state: FSMContext):
         await callback.message.answer(
             f"✅ Трек принят! Спасибо 🎵\n"
             f"🎵 <b>{track_label}</b>\n"
-            f"🔗 {accepted_url}\n\n"
+            f"{url_line}\n\n"
             f"{links_info}\n\n"
             "Голосование начнётся сегодня в 22:00\n"
             "Твой трек будет анонимным до объявления результатов 🕵️",
@@ -3426,14 +3568,16 @@ async def cmd_mytrack(message: Message):
     if not track:
         await message.answer("У тебя пока нет трека в текущей сессии. Нажми «🎵 Отправить трек».")
         return
-    label = format_track_label(track[10] if len(track) > 10 else "", track[9] if len(track) > 9 else "", fallback=track[5])
+    track_url_raw = track[5] or ""
+    label = format_track_label(track[10] if len(track) > 10 else "", track[9] if len(track) > 9 else "", fallback=track_url_raw)
     description = (track[6] or "").strip()
+    url_display = "📎 MP3 файл" if track_url_raw.startswith("tg_audio:") else track_url_raw
     text = (
         f"🎵 <b>Твой трек</b>\n\n"
         f"Неделя: <b>{session[1]}</b>\n"
         f"Тема: <b>{session[2]}</b>\n"
         f"Трек: <b>{label}</b>\n"
-        f"Ссылка: {track[5]}"
+        f"Ссылка: {url_display}"
     )
     if description:
         text += f"\nОписание: {description}"
@@ -3466,7 +3610,7 @@ async def cb_mytrack_replace(callback: CallbackQuery, state: FSMContext):
         return
     await state.set_state(SubmitStates.waiting_track_input)
     await state.update_data(session_id=session_id, pending_token=None, source_type=None)
-    await callback.message.answer("🔁 Пришли новую ссылку или название трека. Сначала покажу варианты, потом подтверждение.")
+    await callback.message.answer("🔁 Пришли новую ссылку, название трека или MP3 файл. Сначала покажу варианты, потом подтверждение.")
     await callback.answer("Режим замены включен")
 
 
@@ -3527,7 +3671,7 @@ async def handle_replace_track(callback: CallbackQuery, state: FSMContext):
     await state.set_state(SubmitStates.waiting_track_input)
     await state.update_data(session_id=session_id, pending_token=None, source_type=None)
     await callback.message.answer(
-        "🔁 Режим замены включен.\n\nПришли новую ссылку или название трека."
+        "🔁 Режим замены включен.\n\nПришли новую ссылку, название трека или MP3 файл."
     )
     await callback.answer("Ожидаю новый трек")
 
